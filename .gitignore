@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+
+# Video/media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wav
+
+# Results (generated output)
+results/
+
+# Environment
+.env
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+/tmp/
+*.log
+
+# Claude
+.claude/
+
+# Shell/IDE configs that leaked into project dir
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.ripgreprc
+.mcp.json
+.idea/
+.vscode/
+.gitmodules
+.dockerignore
+.env.example
+
+# Bare git objects (not part of this repo)
+HEAD
+config
+hooks/
+objects/
+refs/

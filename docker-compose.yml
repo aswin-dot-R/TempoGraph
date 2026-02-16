@@ -1,0 +1,39 @@
+services:
+  tempograph-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"    # API
+      - "8501:8501"    # Streamlit UI
+    volumes:
+      - ./results:/app/results
+      - ./data:/app/data
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      bash -c "uvicorn src.api:app --host 0.0.0.0 --port 8000 &
+             streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0"
+
+  tempograph-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    ports:
+      - "8001:8000"    # API
+      - "8502:8501"    # Streamlit UI
+    volumes:
+      - ./results:/app/results
+      - ./data:/app/data
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    command: >
+      bash -c "uvicorn src.api:app --host 0.0.0.0 --port 8000 &
+             streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0"
