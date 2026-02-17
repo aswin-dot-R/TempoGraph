@@ -23,6 +23,18 @@ class JSONParser:
         Parse VLM output text into AnalysisResult.
         Tries multiple strategies in order.
         """
+        # Pre-processing: strip <think>...</think> blocks (qwen3 models)
+        raw_text = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
+        # For unclosed <think> blocks, strip only the text before the first {
+        if "<think>" in raw_text:
+            brace_pos = raw_text.find("{")
+            if brace_pos != -1:
+                raw_text = raw_text[brace_pos:]
+            else:
+                raw_text = re.sub(r"<think>.*", "", raw_text).strip()
+
+        self.logger.debug(f"Parsing text ({len(raw_text)} chars): {raw_text[:500]}")
+
         # Strategy 1: Extract JSON from markdown code blocks
         json_str = self._extract_json_string(raw_text)
         if json_str is None:
@@ -210,8 +222,8 @@ class JSONParser:
         # Handle various timestamp formats
         ts = ts.strip()
 
-        # Remove trailing non-digit characters (like 's')
-        ts = re.sub(r"[^0-9:]", "", ts)
+        # Remove non-numeric characters except : and .
+        ts = re.sub(r"[^0-9:.]", "", ts)
 
         # Handle cases like "0:03", "00:03", "3", "0:3", "00:03.5", "3.5s"
         if ":" in ts:
@@ -224,12 +236,15 @@ class JSONParser:
             minutes = "00"
             seconds = ts
 
-        # Handle decimal seconds
+        # Handle decimal seconds — take integer part
         if "." in seconds:
-            sec_parts = seconds.split(".")
-            seconds = sec_parts[0]
-            # We'll keep the decimal part for processing but return MM:SS format
-            # For now just return the integer part
+            seconds = seconds.split(".")[0]
+
+        # Fallback for empty strings
+        if not minutes:
+            minutes = "00"
+        if not seconds:
+            seconds = "00"
 
         return f"{minutes.zfill(2)}:{seconds.zfill(2)}"
 

@@ -22,10 +22,24 @@ from src.backends.base import BaseVLMBackend
 from src.json_parser import JSONParser
 from src.models import AnalysisResult
 
-ANALYSIS_PROMPT = """Analyze these video frames and identify entities and events.
+ANALYSIS_PROMPT = """/no_think
+Analyze these video frames and identify all entities and their behaviors over time.
 
-Output ONLY valid JSON (no markdown, no explanation). Use this exact format:
-{"entities": [{"id": "E1", "type": "person/animal/object", "description": "description", "first_seen": "00:00", "last_seen": "00:01"}], "visual_events": [{"type": "idle", "entities": ["E1"], "start_time": "00:00", "end_time": "00:01", "description": "what happened", "confidence": 0.9}], "audio_events": [], "multimodal_correlations": [], "summary": "Brief summary of video content."}"""
+You MUST output ONLY valid JSON. No thinking, no markdown, no explanation before or after.
+
+The JSON must follow this exact schema:
+{"entities": [{"id": "E1", "type": "person", "description": "description here", "first_seen": "00:00", "last_seen": "00:10"}], "visual_events": [{"type": "idle", "entities": ["E1"], "start_time": "00:00", "end_time": "00:05", "description": "what happened", "confidence": 0.8}], "audio_events": [], "multimodal_correlations": [], "summary": "Brief summary."}
+
+Valid behavior types: approach, depart, interact, follow, idle, group, avoid, chase, observe, moving, walking, running, standing, sitting, playing, jumping, other
+
+Instructions:
+- Each entity needs a unique ID like E1, E2, etc.
+- Timestamps are in MM:SS format based on frame position in the video
+- Include ALL entities you can see (people, animals, vehicles, objects)
+- Include ALL behaviors/interactions between entities
+- Be specific in descriptions
+
+Output the JSON now:"""
 
 
 class LlamaServerBackend(BaseVLMBackend):
@@ -120,6 +134,7 @@ class LlamaServerBackend(BaseVLMBackend):
             self.logger.info(
                 f"Got response ({len(response_text)} chars) in {inference_time:.2f}s"
             )
+            self.logger.debug(f"Raw VLM response: {response_text[:2000]}")
             self.logger.info("Analysis complete, parsing response...")
 
             analysis = self.parser.parse(response_text)

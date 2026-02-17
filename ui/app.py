@@ -88,11 +88,11 @@ def main():
                     # Create backend config
                     backend_mode = "llama-server" if "Local" in backend else "gemini"
 
-                    # Check backend availability
+                    # Check GPU availability for local backend
                     if "Local" in backend:
                         import torch
                         if not torch.cuda.is_available():
-                            status.error("❌ No GPU available for local backend. Please use Cloud (Gemini) mode.")
+                            status.error("No GPU available. Local backend requires CUDA GPU. Please use Cloud (Gemini) mode or check your CUDA installation.")
                             st.stop()
 
                     # Create pipeline config
@@ -153,7 +153,7 @@ def main():
 
                             # Add visual events
                             for event in result.analysis.visual_events:
-                                timeline_data["Entity"].extend(event.entities)
+                                timeline_data["Entity"].append(", ".join(event.entities))
                                 timeline_data["Event Type"].append(event.type.value)
                                 timeline_data["Start Time"].append(event.start_time)
                                 timeline_data["End Time"].append(event.end_time)
@@ -322,7 +322,7 @@ def main():
                         if result.detection:
                             detection_json_path = output_dir / "detection.json"
                             with open(detection_json_path, "w") as f:
-                                f.write(result.detection.model_json(indent=2))
+                                f.write(result.detection.model_dump_json(indent=2))
 
                             st.download_button(
                                 label="Download Detection JSON",
@@ -335,7 +335,7 @@ def main():
                         if result.depth:
                             depth_json_path = output_dir / "depth.json"
                             with open(depth_json_path, "w") as f:
-                                f.write(result.depth.model_json(indent=2))
+                                f.write(result.depth.model_dump_json(indent=2))
 
                             st.download_button(
                                 label="Download Depth JSON",

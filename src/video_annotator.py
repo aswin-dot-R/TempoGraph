@@ -98,7 +98,7 @@ class VideoAnnotator:
 
             # Overlay depth map if provided
             if depth and len(depth.frames) > frame_idx:
-                depth_map = cv2.load(np.load(depth.frames[frame_idx].depth_map_path))
+                depth_map = np.load(depth.frames[frame_idx].depth_map_path)
                 frame = self._overlay_depth(frame, depth_map, depth_alpha)
 
             # Write frame to output video

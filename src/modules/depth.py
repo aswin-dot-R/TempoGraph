@@ -92,7 +92,7 @@ class DepthEstimator:
 
         # Load weights
         weights_path = self._get_weights_path()
-        self._model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+        self._model.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
 
         # Move to device
         self._model = self._model.to(self.device).eval()

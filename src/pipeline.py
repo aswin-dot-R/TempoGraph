@@ -128,14 +128,14 @@ class Pipeline:
         self._log_vram("before detection")
 
         # Create detector
-        detector = ObjectDetector(
+        self._detector = ObjectDetector(
             confidence=self.config.confidence,
             imgsz=640,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
         # Run detection
-        detection = detector.detect_frames(extraction.frame_paths)
+        detection = self._detector.detect_frames(extraction.frame_paths)
 
         # Log VRAM after
         self._log_vram("after detection")
@@ -150,12 +150,12 @@ class Pipeline:
         self._log_vram("before depth")
 
         # Create depth estimator
-        depth_estimator = DepthEstimator(
+        self._depth_estimator = DepthEstimator(
             model_variant="vits", device="cuda" if torch.cuda.is_available() else "cpu"
         )
 
         # Run depth estimation
-        depth = depth_estimator.estimate_frames(
+        depth = self._depth_estimator.estimate_frames(
             extraction.frame_paths,
             output_dir=str(Path(self.config.output_dir) / "depth"),
         )
