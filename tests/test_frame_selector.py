@@ -67,3 +67,31 @@ def test_returns_deltas_and_threshold_for_plotting():
 
         assert len(result.deltas) == len(result.scan_indices)
         assert result.threshold > 0
+
+
+def test_moving_mode_compensates_pure_pan():
+    """A pure pan should yield low residual delta (motion is cancelled)."""
+    with tempfile.TemporaryDirectory() as td:
+        video = Path(td) / "v.mp4"
+        # Synthetic pan: a textured frame translated horizontally over time
+        w, h = 320, 240
+        rng = np.random.default_rng(42)
+        base = rng.integers(0, 255, (h, w * 2, 3), dtype=np.uint8)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video), fourcc, 30.0, (w, h))
+        for i in range(60):
+            shift = i * 2  # 2 pixels per frame
+            frame = base[:, shift:shift + w].copy()
+            writer.write(frame)
+        writer.release()
+
+        result = FrameSelector().select(
+            video_path=str(video),
+            camera_mode=CameraMode.MOVING,
+            sample_fps=1.0,
+            threshold_mult=2.0,
+        )
+
+        # With motion compensation, residual deltas should be small overall.
+        # We expect very few keyframes (no real scene change occurred).
+        assert len(result.keyframe_indices) <= 3
