@@ -204,3 +204,44 @@ class PipelineV2:
             paths.append(p)
         cap.release()
         return paths
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="TempoGraph v2 pipeline")
+    parser.add_argument("--video", required=True)
+    parser.add_argument("--output", default="results/v2_run")
+    parser.add_argument("--camera", default="static",
+                        choices=["static", "moving", "auto"])
+    parser.add_argument("--yolo-fps", type=float, default=1.0)
+    parser.add_argument("--vlm-fps", type=float, default=0.5)
+    parser.add_argument("--chunk-size", type=int, default=10)
+    parser.add_argument("--depth", action="store_true")
+    parser.add_argument("--seg", action="store_true",
+                        help="Use yolo11n-seg.pt instead of yolo11n.pt")
+    parser.add_argument("--confidence", type=float, default=0.5)
+    parser.add_argument("--threshold-mult", type=float, default=1.0)
+    args = parser.parse_args()
+
+    config = PipelineConfig(
+        backend="llama-server",
+        modules={"behavior": True, "detection": True, "depth": args.depth, "audio": False},
+        fps=args.yolo_fps,
+        max_frames=999,
+        confidence=args.confidence,
+        video_path=args.video,
+        output_dir=args.output,
+    )
+    pipe = PipelineV2(
+        config,
+        camera_mode=CameraMode(args.camera),
+        yolo_fps=args.yolo_fps,
+        vlm_fps=args.vlm_fps,
+        chunk_size=args.chunk_size,
+        depth_enabled=args.depth,
+        use_segmentation=args.seg,
+        threshold_mult=args.threshold_mult,
+    )
+    result = pipe.run()
+    print(f"Done in {result.processing_time:.1f}s -> {args.output}")
