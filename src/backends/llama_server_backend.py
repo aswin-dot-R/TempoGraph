@@ -12,15 +12,16 @@ The server handles VRAM management and model loading.
 
 import base64
 import logging
+import re
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
 from src.backends.base import BaseVLMBackend
 from src.json_parser import JSONParser
-from src.models import AnalysisResult
+from src.models import AnalysisResult, ChunkCaption
 
 ANALYSIS_PROMPT = """/no_think
 Analyze these video frames and identify all entities and their behaviors over time.
@@ -155,6 +156,128 @@ class LlamaServerBackend(BaseVLMBackend):
         except Exception as e:
             self.logger.error(f"Error during analysis: {e}")
             raise
+
+    CHUNK_PROMPT_TEMPLATE = """You are watching a short segment of a video. Describe what is happening across these frames in chronological order.
+
+Previous segment summary: {seed}
+
+For each frame below, output ONE LINE describing the action. If consecutive frames show no significant change, write "(no change)". End with ONE LINE summarizing this segment in <= 20 words for use as context in the next segment.
+
+Frame data:
+{frame_block}
+
+Output format:
+FRAME_<idx>: <description>
+...
+SUMMARY: <one-line segment summary>
+"""
+
+    def caption_chunks(
+        self,
+        chunks: List[Tuple[int, List[int]]],
+        db,
+    ) -> List[ChunkCaption]:
+        """Caption each chunk; previous chunk's summary becomes the seed for the next."""
+        seed = "this is the start"
+        results: List[ChunkCaption] = []
+
+        for chunk_id, frame_indices in chunks:
+            try:
+                images_b64 = []
+                frame_lines = []
+                for fidx in frame_indices:
+                    frow = db.get_frame(fidx)
+                    if not frow:
+                        continue
+                    images_b64.append(self._encode_image(Path(frow["image_path"])))
+                    dets = db.get_detections_for_frame(fidx)
+                    det_text = self._format_detections(dets)
+                    ts = self._format_timestamp_ms(frow["timestamp_ms"])
+                    frame_lines.append(f"[frame {fidx} — t={ts}] YOLO: {det_text}")
+
+                prompt = self.CHUNK_PROMPT_TEMPLATE.format(
+                    seed=seed, frame_block="\n".join(frame_lines)
+                )
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "user", "content": prompt, "images": images_b64}
+                    ],
+                    "stream": False,
+                    "options": {
+                        "temperature": self.temperature,
+                        "num_predict": self.max_tokens,
+                    },
+                }
+                response = requests.post(
+                    f"{self.base_url}/api/chat", json=payload, timeout=600
+                )
+                response.raise_for_status()
+                content = response.json().get("message", {}).get("content", "")
+                per_frame, summary = self._parse_chunk_response(content, frame_indices)
+
+                results.append(
+                    ChunkCaption(
+                        chunk_id=chunk_id,
+                        frame_indices=list(frame_indices),
+                        per_frame_lines=per_frame,
+                        summary=summary,
+                        raw_response=content,
+                    )
+                )
+                if summary:
+                    seed = summary
+            except Exception as e:
+                self.logger.warning(f"Chunk {chunk_id} failed: {e}")
+                results.append(
+                    ChunkCaption(
+                        chunk_id=chunk_id,
+                        frame_indices=list(frame_indices),
+                        per_frame_lines={},
+                        summary="",
+                        raw_response="",
+                    )
+                )
+
+        return results
+
+    @staticmethod
+    def _format_detections(dets) -> str:
+        if not dets:
+            return "(none)"
+        parts = []
+        for d in dets:
+            base = (
+                f"{d['class_name']} at [{d['x1']:.2f},{d['y1']:.2f},"
+                f"{d['x2']:.2f},{d['y2']:.2f}] conf={d['confidence']:.2f}"
+            )
+            if d.get("mean_depth") is not None:
+                base += f" depth={d['mean_depth']:.2f}"
+            parts.append(base)
+        return "; ".join(parts)
+
+    @staticmethod
+    def _format_timestamp_ms(ms: int) -> str:
+        s = ms / 1000.0
+        m = int(s // 60)
+        sec = s - m * 60
+        return f"{m:02d}:{sec:05.2f}"
+
+    @staticmethod
+    def _parse_chunk_response(text: str, frame_indices) -> Tuple[Dict[int, str], str]:
+        per_frame: Dict[int, str] = {}
+        summary = ""
+        for line in text.splitlines():
+            line = line.strip()
+            m = re.match(r"FRAME[_ ]?(\d+)\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+            if m:
+                idx = int(m.group(1))
+                per_frame[idx] = m.group(2).strip()
+                continue
+            sm = re.match(r"SUMMARY\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+            if sm:
+                summary = sm.group(1).strip()
+        return per_frame, summary
 
     def is_available(self) -> bool:
         """Check if server is running."""
