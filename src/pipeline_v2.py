@@ -44,6 +44,7 @@ class PipelineV2:
         threshold_mult: float = 1.0,
         jpeg_quality: int = 80,
         frame_max_width: int = 640,
+        skip_vlm: bool = False,
     ):
         self.config = config
         self.camera_mode = camera_mode
@@ -55,6 +56,7 @@ class PipelineV2:
         self.threshold_mult = threshold_mult
         self.jpeg_quality = jpeg_quality
         self.frame_max_width = frame_max_width
+        self.skip_vlm = skip_vlm
         self.logger = logging.getLogger(__name__)
 
     def run(self) -> PipelineResult:
@@ -129,6 +131,21 @@ class PipelineV2:
                 keyframe_indices=set(selection.keyframe_indices),
                 k=k,
             )
+
+            if self.skip_vlm:
+                self.logger.info(
+                    "Skipping VLM stages (skip_vlm=True). "
+                    "Stopped after frame scoring."
+                )
+                elapsed = time.time() - start
+                return PipelineResult(
+                    analysis=None,
+                    detection=None,
+                    depth=None,
+                    config=self.config,
+                    annotated_video_path=None,
+                    processing_time=elapsed,
+                )
 
             # Stage 5: chunked VLM
             chunks: List[Tuple[int, List[int]]] = []
@@ -220,6 +237,7 @@ if __name__ == "__main__":
     parser.add_argument("--depth", action="store_true")
     parser.add_argument("--seg", action="store_true",
                         help="Use yolo11n-seg.pt instead of yolo11n.pt")
+    parser.add_argument("--skip-vlm", action="store_true")
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--threshold-mult", type=float, default=1.0)
     args = parser.parse_args()
@@ -242,6 +260,7 @@ if __name__ == "__main__":
         depth_enabled=args.depth,
         use_segmentation=args.seg,
         threshold_mult=args.threshold_mult,
+        skip_vlm=args.skip_vlm,
     )
     result = pipe.run()
     print(f"Done in {result.processing_time:.1f}s -> {args.output}")
