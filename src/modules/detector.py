@@ -35,12 +35,18 @@ VRAM management:
 """
 
 import time
-import torch
 import gc
 import logging
 from pathlib import Path
 from typing import List, Optional
 from src.models import DetectionResult, DetectionBox
+
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
 
 class ObjectDetector:
@@ -75,7 +81,7 @@ class ObjectDetector:
         self._model = YOLO(self.model_path)
 
         # Move to device
-        if self.device == "cuda" and torch.cuda.is_available():
+        if self.device == "cuda" and _TORCH_AVAILABLE and torch.cuda.is_available():
             self._model.to(self.device)
             self.logger.info("YOLO model loaded on CUDA")
 
@@ -164,6 +170,70 @@ class ObjectDetector:
             frame_count=len(frame_paths),
         )
 
+    def detect_to_db(
+        self,
+        frame_indices,
+        frame_paths,
+        db,
+        frame_width: int,
+        frame_height: int,
+    ):
+        """Run detection on frames and insert normalized rows into the DB."""
+        self._load_model()
+        self.logger.info(f"Detect-to-DB: {len(frame_paths)} frames")
+
+        for frame_idx, frame_path in zip(frame_indices, frame_paths):
+            try:
+                frame = self._read_frame(frame_path)
+                results = self._model.track(
+                    frame,
+                    conf=self.confidence,
+                    imgsz=self.imgsz,
+                    persist=True,
+                    verbose=False,
+                )
+                if not results:
+                    continue
+                result = results[0]
+                if result.boxes is None or len(result.boxes) == 0:
+                    continue
+
+                track_ids = None
+                if result.boxes.id is not None:
+                    track_ids = result.boxes.id
+
+                for i, box in enumerate(result.boxes):
+                    xyxy = box.xyxy[0]
+                    if hasattr(xyxy, "cpu"):
+                        xyxy = xyxy.cpu().numpy()
+                    x1, y1, x2, y2 = [float(v) for v in xyxy]
+
+                    conf = box.conf[0] if hasattr(box.conf, "__getitem__") else box.conf
+                    conf = float(conf)
+                    cls_idx = int(box.cls[0]) if hasattr(box.cls, "__getitem__") else int(box.cls)
+                    class_name = self._model.names[cls_idx]
+
+                    track_id = None
+                    if track_ids is not None and i < len(track_ids):
+                        try:
+                            track_id = int(track_ids[i])
+                        except (TypeError, ValueError):
+                            track_id = None
+
+                    db.insert_detection(
+                        frame_idx=int(frame_idx),
+                        track_id=track_id,
+                        class_name=class_name,
+                        x1=x1 / frame_width,
+                        y1=y1 / frame_height,
+                        x2=x2 / frame_width,
+                        y2=y2 / frame_height,
+                        confidence=conf,
+                    )
+            except Exception as e:
+                self.logger.warning(f"detect_to_db error frame {frame_idx}: {e}")
+                continue
+
     def _read_frame(self, frame_path: Path) -> Optional[object]:
         """Read frame using OpenCV."""
         import cv2
@@ -181,7 +251,7 @@ class ObjectDetector:
             del self._model
             self._model = None
         gc.collect()
-        if torch.cuda.is_available():
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
             vram_after = torch.cuda.memory_allocated() / 1e9
             self.logger.info(f"VRAM after cleanup: {vram_after:.2f}GB")

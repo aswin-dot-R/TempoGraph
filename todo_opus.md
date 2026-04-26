@@ -1,4 +1,10 @@
 # TempoGraph — Opus Build Tasks
+
+> Historical note: this is an earlier implementation work plan for the legacy
+> build phase. It remains useful as background context, but it is not the
+> current source-of-truth documentation. See `README.md` for the current repo
+> overview.
+
 ## Frontier Model Workstream (Run After Nemotron Completes)
 
 > **For:** Claude Opus via claude.ai or Claude Code

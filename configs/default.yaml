@@ -1,3 +1,7 @@
+# Legacy-oriented default configuration.
+# The current Streamlit UI and PipelineV2 expose runtime controls directly and
+# do not consume this file end-to-end yet.
+
 pipeline:
   backend: "gemini"          # "gemini" or "qwen"
   modules:

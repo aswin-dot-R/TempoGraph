@@ -1,4 +1,9 @@
 # TempoGraph — Nemotron Build Tasks
+
+> Historical note: this is an earlier implementation work plan. It is useful
+> for provenance, but it is not the current architecture reference. See
+> `README.md` for the current repo overview.
+
 ## Local Model Workstream (Run First)
 
 > **For:** Nemotron 30B via Claude Code

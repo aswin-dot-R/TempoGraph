@@ -2,6 +2,10 @@
 
 from .base import BaseVLMBackend
 from .gemini_backend import GeminiBackend
-from .qwen_backend import QwenBackend
+
+try:
+    from .qwen_backend import QwenBackend
+except ImportError:
+    QwenBackend = None  # type: ignore[assignment,misc]
 
 __all__ = ["BaseVLMBackend", "GeminiBackend", "QwenBackend"]

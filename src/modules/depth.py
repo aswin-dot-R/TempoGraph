@@ -47,13 +47,19 @@ VRAM management: same pattern — load, process all frames, cleanup.
 
 import os
 import gc
-import torch
 import cv2
 import numpy as np
 import logging
 from pathlib import Path
 from typing import List
 from src.models import DepthResult, DepthFrame
+
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
 
 class DepthEstimator:
@@ -197,6 +203,55 @@ class DepthEstimator:
 
         return DepthResult(frames=frames)
 
+    def estimate_to_db(
+        self,
+        frame_indices,
+        frame_paths,
+        db,
+        output_dir: str,
+    ) -> None:
+        """Run depth estimation; save .npy per frame; populate per-bbox mean depth."""
+        os.makedirs(output_dir, exist_ok=True)
+        self._load_model()
+        self.logger.info(f"Depth-to-DB: {len(frame_paths)} frames")
+
+        for frame_idx, frame_path in zip(frame_indices, frame_paths):
+            try:
+                raw = cv2.imread(str(frame_path))
+                if raw is None:
+                    self.logger.warning(f"Could not read {frame_path}")
+                    continue
+                depth = self._model.infer_image(raw)
+
+                # Normalize to [0,1] and save as .npy
+                d_min, d_max = float(depth.min()), float(depth.max())
+                if d_max > d_min:
+                    depth_norm = (depth - d_min) / (d_max - d_min)
+                else:
+                    depth_norm = np.zeros_like(depth)
+
+                npy_path = os.path.join(output_dir, f"depth_{frame_idx:06d}.npy")
+                np.save(npy_path, depth_norm.astype(np.float32))
+                db.insert_depth_frame(frame_idx=int(frame_idx), depth_npy_path=npy_path)
+
+                # Per-bbox mean depth computed from raw depth values
+                h, w = depth.shape[:2]
+                for det in db.get_detections_for_frame(int(frame_idx)):
+                    bx1 = max(0, int(det["x1"] * w))
+                    by1 = max(0, int(det["y1"] * h))
+                    bx2 = min(w, int(det["x2"] * w))
+                    by2 = min(h, int(det["y2"] * h))
+                    if bx2 <= bx1 or by2 <= by1:
+                        continue
+                    region = depth[by1:by2, bx1:bx2]
+                    if region.size == 0:
+                        continue
+                    mean_d = float(np.mean(region))
+                    db.set_detection_mean_depth(det["detection_id"], mean_d)
+            except Exception as e:
+                self.logger.warning(f"depth-to-db error frame {frame_idx}: {e}")
+                continue
+
     def cleanup(self):
         """Free GPU memory."""
         self.logger.info("Cleaning up depth estimator...")
@@ -204,7 +259,7 @@ class DepthEstimator:
             del self._model
             self._model = None
         gc.collect()
-        if self.device == "cuda" and torch.cuda.is_available():
+        if self.device == "cuda" and _TORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
             vram_after = torch.cuda.memory_allocated() / 1e9
             self.logger.info(f"VRAM after cleanup: {vram_after:.2f}GB")
