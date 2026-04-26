@@ -1,5 +1,9 @@
 # TempoGraph Opus Build - Completion Summary
 
+> Historical note: this document summarizes the original Opus workstream for
+> the legacy pipeline. The repo now also contains `PipelineV2`, and the
+> current high-level overview lives in `README.md`.
+
 ## Overview
 All Opus tasks have been successfully completed. The TempoGraph video intelligence pipeline is now fully functional with both cloud and local backends.
 
