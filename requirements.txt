@@ -22,14 +22,21 @@ bitsandbytes>=0.41.0
 ultralytics>=8.0.0
 
 # Audio processing
-openai-whisper>=20231117
+# Note: openai-whisper is NOT used — we use whisper.cpp (subprocess).
+# Keeping the dep only for offline fallback research scripts.
+# openai-whisper>=20231117
 
 # Depth estimation
-depth-anything-v2>=1.0.0
+# Note: depth-anything-v2 PyPI only has 0.1.0 — pipeline uses
+# transformers depth-estimation pipeline directly instead.
+# depth-anything-v2>=0.1.0
 
 # UI
 streamlit>=1.28.0
 plotly>=5.17.0
+
+# Graph visualisation
+pyvis>=0.3.2
 
 # Utilities
 pyyaml>=6.0

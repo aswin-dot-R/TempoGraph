@@ -332,7 +332,9 @@ class PipelineV2:
             if self.vlm_dedup_threshold > 0 and len(vlm_frames) > 1:
                 pre_dedup = len(vlm_frames)
                 vlm_frames = self._deduplicate_vlm_frames(
-                    vlm_frames, out_dir / "frames",
+                    vlm_frames,
+                    out_dir / "frames",
+                    keyframe_indices=set(selection.keyframe_indices),
                 )
                 dropped = pre_dedup - len(vlm_frames)
                 if dropped:
@@ -491,14 +493,22 @@ class PipelineV2:
             return 0.0
 
     def _deduplicate_vlm_frames(
-        self, vlm_frames: List[int], frames_dir: Path,
+        self,
+        vlm_frames: List[int],
+        frames_dir: Path,
+        keyframe_indices: Optional[set] = None,
     ) -> List[int]:
         """Remove visually redundant frames from the VLM set.
 
         Compares consecutive frames as 64×64 grayscale thumbnails.
         Drops a frame if its similarity to the previous kept frame
         exceeds ``vlm_dedup_threshold``.
+
+        Keyframes (motion peaks from FrameSelector) are always preserved
+        regardless of similarity, since they were specifically chosen for
+        being visually distinctive moments.
         """
+        protected = set(keyframe_indices or ())
         kept: List[int] = [vlm_frames[0]]
         prev_thumb = self._load_thumb(frames_dir / f"frame_{vlm_frames[0]:06d}.jpg")
         if prev_thumb is None:
@@ -508,6 +518,11 @@ class PipelineV2:
             thumb = self._load_thumb(frames_dir / f"frame_{idx:06d}.jpg")
             if thumb is None:
                 kept.append(idx)
+                continue
+            # Always keep keyframes, even if visually similar to neighbour.
+            if idx in protected:
+                kept.append(idx)
+                prev_thumb = thumb
                 continue
             diff = cv2.absdiff(prev_thumb, thumb)
             mean_diff = cv2.mean(diff)[0] / 255.0

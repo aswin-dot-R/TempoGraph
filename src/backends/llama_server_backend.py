@@ -173,7 +173,9 @@ class LlamaServerBackend(BaseVLMBackend):
 
 Previous segment summary: {seed}
 
-For each frame below, output ONE LINE describing the action. If consecutive frames show no significant change, write "(no change)". End with ONE LINE summarizing this segment in <= 20 words for use as context in the next segment.
+{entity_block}For each frame below, output ONE LINE describing the action. If consecutive frames show no significant change, write "(no change)". End with ONE LINE summarizing this segment in <= 20 words for use as context in the next segment.
+
+IMPORTANT: When referring to people or objects, reuse entity IDs from the known-entities list above if they are the same person/object. Only create new IDs (E<next>, E<next+1>, ...) for genuinely NEW entities. After the SUMMARY line, list any NEW entities introduced in this chunk.
 
 Frame data:
 {frame_block}
@@ -182,6 +184,7 @@ Output format:
 FRAME_<idx>: <description>
 ...
 SUMMARY: <one-line segment summary>
+NEW_ENTITIES: <comma-separated list like 'E3=red car, E4=brown dog' or 'none'>
 """
 
     def caption_chunks(
@@ -191,6 +194,7 @@ SUMMARY: <one-line segment summary>
         on_chunk: Optional[Callable[[dict], None]] = None,
     ) -> List[ChunkCaption]:
         seed = "this is the start"
+        entity_registry: Dict[str, str] = {}  # e.g. {"E1": "boy in blue shirt", "E2": "T-Rex"}
         results: List[ChunkCaption] = []
         n_ctx = self.get_n_ctx()
         n_total = len(chunks)
@@ -211,8 +215,11 @@ SUMMARY: <one-line segment summary>
                     ts = self._format_timestamp_ms(frow["timestamp_ms"])
                     frame_lines.append(f"[frame {fidx} — t={ts}] YOLO: {det_text}")
 
+                entity_block = self._format_entity_block(entity_registry)
                 prompt = self.CHUNK_PROMPT_TEMPLATE.format(
-                    seed=seed, frame_block="\n".join(frame_lines)
+                    seed=seed,
+                    entity_block=entity_block,
+                    frame_block="\n".join(frame_lines),
                 )
                 payload = self._build_payload(prompt, images_b64)
                 response = requests.post(
@@ -225,6 +232,10 @@ SUMMARY: <one-line segment summary>
                 content = self._extract_content(resp_json)
                 usage = self._extract_usage(resp_json)
                 per_frame, summary = self._parse_chunk_response(content, frame_indices)
+
+                # Update entity registry from NEW_ENTITIES line
+                new_entities = self._parse_new_entities(content)
+                entity_registry.update(new_entities)
 
                 results.append(
                     ChunkCaption(
@@ -322,6 +333,45 @@ SUMMARY: <one-line segment summary>
             if sm:
                 summary = sm.group(1).strip()
         return per_frame, summary
+
+    @staticmethod
+    def _parse_new_entities(text: str) -> Dict[str, str]:
+        """Extract new entity definitions from the NEW_ENTITIES line.
+
+        Expected format:
+            NEW_ENTITIES: E3=red car, E4=brown dog
+        or:
+            NEW_ENTITIES: none
+        """
+        entities: Dict[str, str] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            m = re.match(r"NEW_ENTITIES\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+            if m:
+                raw = m.group(1).strip()
+                if raw.lower() in ("none", "n/a", "-", ""):
+                    break
+                for pair in raw.split(","):
+                    pair = pair.strip()
+                    eq = pair.find("=")
+                    if eq > 0:
+                        eid = pair[:eq].strip()
+                        desc = pair[eq + 1:].strip()
+                        entities[eid] = desc
+                break
+        return entities
+
+    @staticmethod
+    def _format_entity_block(registry: Dict[str, str]) -> str:
+        """Format the entity registry for injection into the prompt."""
+        if not registry:
+            return "Known entities so far: (none — this is the first segment)\n\n"
+        lines = [f"  {eid}: {desc}" for eid, desc in sorted(registry.items())]
+        return (
+            "Known entities so far (reuse these IDs if you see the same entity):\n"
+            + "\n".join(lines)
+            + "\n\n"
+        )
 
     def is_available(self) -> bool:
         try:

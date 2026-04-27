@@ -284,6 +284,7 @@ def _run_pipeline(
     except Exception:
         est = None
 
+    eta_placeholder = st.empty()
     if est is not None:
         eta_total_s = int(est.total_s)
         eta_html = f"""
@@ -343,7 +344,8 @@ def _run_pipeline(
     }}, 200);
   }})();
 </script>"""
-        st.components.v1.html(eta_html, height=150)
+        with eta_placeholder.container():
+            st.components.v1.html(eta_html, height=150)
 
     # Live VLM context-window panel — appears once Stage 5 starts emitting.
     ctx_panel = st.empty()
@@ -484,16 +486,37 @@ def _run_pipeline(
             result = pipe.run()
             status.update(label="Done", state="complete")
             actual_s = result.processing_time
+            # Replace the live ticker with a static "done" panel so the JS
+            # setInterval inside the iframe stops.
             if est is not None:
                 pct_of_eta = 100 * actual_s / max(1.0, est.total_s)
                 delta_s = actual_s - est.total_s
                 sign = "+" if delta_s >= 0 else "−"
+                done_color = "#66bb6a" if pct_of_eta <= 120 else "#ffa726"
+                eta_placeholder.markdown(
+                    f'<div style="border:1px solid #2a2e35;border-radius:6px;'
+                    f'padding:10px;background:#1c1f24;color:#e0e0e0;'
+                    f'font-family:system-ui;font-size:14px">'
+                    f'<span style="color:{done_color}">✓ Done</span> &mdash; '
+                    f'<b style="font-size:18px;color:#9ecbff">{format_seconds(actual_s)}</b>'
+                    f'  (ETA was {format_seconds(est.total_s)}, '
+                    f'{sign}{format_seconds(abs(delta_s))} = '
+                    f'{pct_of_eta:.0f}% of ETA)'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
                 st.success(
                     f"Done in {format_seconds(actual_s)} "
                     f"(ETA was {format_seconds(est.total_s)}, "
                     f"{sign}{format_seconds(abs(delta_s))} = {pct_of_eta:.0f}% of ETA)"
                 )
             else:
+                eta_placeholder.markdown(
+                    f'<div style="border:1px solid #2a2e35;border-radius:6px;'
+                    f'padding:10px;background:#1c1f24;color:#66bb6a;'
+                    f'font-family:system-ui">✓ Done in {format_seconds(actual_s)}</div>',
+                    unsafe_allow_html=True,
+                )
                 st.success(f"Done in {actual_s:.1f}s")
             if result.analysis:
                 st.subheader("Summary")
@@ -512,6 +535,13 @@ def _run_pipeline(
                 ])
         except Exception as e:
             status.update(label=f"Failed: {e}", state="error")
+            eta_placeholder.markdown(
+                f'<div style="border:1px solid #ef5350;border-radius:6px;'
+                f'padding:10px;background:#1c1f24;color:#ef5350;'
+                f'font-family:system-ui">✗ Pipeline failed: '
+                f'{str(e)[:200]}</div>',
+                unsafe_allow_html=True,
+            )
             import traceback
             st.code(traceback.format_exc())
 
