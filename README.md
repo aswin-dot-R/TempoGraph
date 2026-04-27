@@ -4,7 +4,12 @@
 
 TempoGraph is a multimodal video-analysis pipeline. Two generations live side
 by side in the repo, but **v2 is the active path** — that's what the
-Streamlit UI runs and what this README documents in detail. The legacy
+Streamlit UI runs and what this README covers.
+
+> **Looking for the deep technical doc?** Every stage, every knob, every
+> output file, every API call we make — see
+> [`docs/PIPELINE.md`](docs/PIPELINE.md). This README is the quickstart;
+> that doc is the source of truth. The legacy
 `src/pipeline.py` path is still importable for the Gemini cloud backend; see
 [Legacy pipeline](#legacy-pipeline) at the bottom.
 

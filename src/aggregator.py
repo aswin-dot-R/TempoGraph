@@ -59,10 +59,12 @@ class CaptionAggregator:
         self.logger = logging.getLogger(__name__)
 
     def aggregate(self, chunks: List[ChunkCaption],
-                  transcript_segments: Optional[list] = None) -> AnalysisResult:
+                  transcript_segments: Optional[list] = None,
+                  on_call: Optional[callable] = None) -> AnalysisResult:
         if not chunks:
             return AnalysisResult(summary="No captions produced.")
 
+        self._on_call = on_call
         transcript_text = self._format_transcript(transcript_segments or [])
 
         if len(chunks) <= self.single_pass_max_chunks:
@@ -144,6 +146,17 @@ class CaptionAggregator:
             )
             response.raise_for_status()
             data = response.json()
+            usage = data.get("usage") or {}
+            cb = getattr(self, "_on_call", None)
+            if cb is not None:
+                try:
+                    cb({
+                        "prompt_tokens": int(usage.get("prompt_tokens", 0)),
+                        "completion_tokens": int(usage.get("completion_tokens", 0)),
+                        "total_tokens": int(usage.get("total_tokens", 0)),
+                    })
+                except Exception:
+                    pass
             choices = data.get("choices") or []
             if not choices:
                 return ""

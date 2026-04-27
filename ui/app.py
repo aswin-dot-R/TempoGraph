@@ -334,6 +334,68 @@ def _run_pipeline(
 </script>"""
         st.components.v1.html(eta_html, height=150)
 
+    # Live VLM context-window panel — appears once Stage 5 starts emitting.
+    ctx_panel = st.empty()
+    ctx_state: dict = {"chunks": [], "n_ctx": None, "max_prompt": 0, "agg": None}
+
+    def _render_ctx_panel() -> None:
+        if not ctx_state["chunks"] and ctx_state["agg"] is None:
+            return
+        n_ctx = ctx_state["n_ctx"] or 100096
+        rows_html = ""
+        for c in ctx_state["chunks"]:
+            pct = 100.0 * c["prompt_tokens"] / n_ctx if n_ctx else 0
+            bar_color = "#42a5f5" if pct < 60 else "#ffa726" if pct < 85 else "#ef5350"
+            rows_html += (
+                f'<div style="display:flex;gap:10px;align-items:center;'
+                f'font-size:12px;margin:2px 0">'
+                f'<span style="color:#888;width:80px">chunk {c["chunk_id"]}/{c["n_total"]-1}</span>'
+                f'<span style="color:#bbb;width:90px">{c["n_images"]} imgs</span>'
+                f'<div style="flex:1;background:#0e1117;border-radius:3px;height:6px;'
+                f'overflow:hidden">'
+                f'<div style="background:{bar_color};height:6px;'
+                f'width:{min(100,pct):.1f}%"></div></div>'
+                f'<span style="color:#ddd;width:140px;text-align:right">'
+                f'{c["prompt_tokens"]:,} / {n_ctx:,} ({pct:.1f}%)</span>'
+                f'<span style="color:#888;width:60px;text-align:right">'
+                f'{c["elapsed_s"]}s</span>'
+                f'</div>'
+            )
+        agg_html = ""
+        if ctx_state["agg"] is not None:
+            a = ctx_state["agg"]
+            pct = 100.0 * a["prompt_tokens"] / n_ctx if n_ctx else 0
+            bar_color = "#42a5f5" if pct < 60 else "#ffa726" if pct < 85 else "#ef5350"
+            agg_html = (
+                f'<div style="display:flex;gap:10px;align-items:center;'
+                f'font-size:12px;margin-top:6px;border-top:1px solid #2a2e35;padding-top:6px">'
+                f'<span style="color:#888;width:80px">aggregator</span>'
+                f'<span style="color:#bbb;width:90px">text-only</span>'
+                f'<div style="flex:1;background:#0e1117;border-radius:3px;height:6px;'
+                f'overflow:hidden">'
+                f'<div style="background:{bar_color};height:6px;'
+                f'width:{min(100,pct):.1f}%"></div></div>'
+                f'<span style="color:#ddd;width:140px;text-align:right">'
+                f'{a["prompt_tokens"]:,} / {n_ctx:,} ({pct:.1f}%)</span>'
+                f'<span style="color:#888;width:60px;text-align:right"></span>'
+                f'</div>'
+            )
+        max_pct = 100.0 * ctx_state["max_prompt"] / n_ctx if n_ctx else 0
+        max_color = "#42a5f5" if max_pct < 60 else "#ffa726" if max_pct < 85 else "#ef5350"
+        ctx_panel.markdown(
+            f'<div style="border:1px solid #2a2e35;border-radius:6px;padding:10px;'
+            f'background:#1c1f24;color:#e0e0e0;font-family:system-ui">'
+            f'<div style="display:flex;justify-content:space-between;'
+            f'align-items:baseline;margin-bottom:6px">'
+            f'<b style="font-size:13px">VLM context window usage (live)</b>'
+            f'<span style="font-size:12px;color:{max_color}">'
+            f'peak: {ctx_state["max_prompt"]:,} / {n_ctx:,} ({max_pct:.1f}%)</span>'
+            f'</div>'
+            f'{rows_html}{agg_html}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
     with st.status("Running v2 pipeline...", expanded=True) as status:
         try:
             stage_log = st.empty()
@@ -348,6 +410,25 @@ def _run_pipeline(
                 }.get(event, "•")
 
             def on_stage(name: str, event: str, info: dict) -> None:
+                # Per-chunk VLM events update the context-window panel only —
+                # they'd flood the stage log otherwise.
+                if name == "VLM chunk" and event == "done":
+                    if info.get("n_ctx"):
+                        ctx_state["n_ctx"] = info["n_ctx"]
+                    ctx_state["chunks"].append(info)
+                    ctx_state["max_prompt"] = max(
+                        ctx_state["max_prompt"], info.get("prompt_tokens", 0)
+                    )
+                    _render_ctx_panel()
+                    return
+                if name == "Aggregator call" and event == "done":
+                    ctx_state["agg"] = info
+                    ctx_state["max_prompt"] = max(
+                        ctx_state["max_prompt"], info.get("prompt_tokens", 0)
+                    )
+                    _render_ctx_panel()
+                    return
+
                 if event == "start":
                     line = f"{_icon(event)} {name} — running…"
                     if info:

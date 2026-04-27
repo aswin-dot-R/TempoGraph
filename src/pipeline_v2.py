@@ -356,7 +356,11 @@ class PipelineV2:
             t0 = time.time()
             backend = LlamaServerBackend(base_url=self.vlm_url, model=self.vlm_model)
             self._ensure_vlm_ready(backend)
-            chunk_caps = backend.caption_chunks(chunks=chunks, db=db)
+
+            def _chunk_cb(info: dict) -> None:
+                self._stage("VLM chunk", "done", **info)
+
+            chunk_caps = backend.caption_chunks(chunks=chunks, db=db, on_chunk=_chunk_cb)
             try:
                 with open(out_dir / "chunks.json", "w") as f:
                     json.dump(
@@ -389,9 +393,13 @@ class PipelineV2:
             transcript_segments = (
                 db.get_audio_segments() if self.audio_enabled else []
             )
+            def _agg_cb(info: dict) -> None:
+                self._stage("Aggregator call", "done", **info)
+
             analysis = CaptionAggregator(
                 base_url=self.vlm_url, model=self.vlm_model
-            ).aggregate(chunk_caps, transcript_segments=transcript_segments)
+            ).aggregate(chunk_caps, transcript_segments=transcript_segments,
+                        on_call=_agg_cb)
             self._stage(
                 "Aggregation", "done",
                 elapsed_s=round(time.time() - t0, 2),

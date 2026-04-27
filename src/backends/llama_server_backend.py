@@ -12,7 +12,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -188,11 +188,16 @@ SUMMARY: <one-line segment summary>
         self,
         chunks: List[Tuple[int, List[int]]],
         db,
+        on_chunk: Optional[Callable[[dict], None]] = None,
     ) -> List[ChunkCaption]:
         seed = "this is the start"
         results: List[ChunkCaption] = []
+        n_ctx = self.get_n_ctx()
+        n_total = len(chunks)
 
         for chunk_id, frame_indices in chunks:
+            t0 = time.time()
+            usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             try:
                 images_b64: List[str] = []
                 frame_lines: List[str] = []
@@ -216,7 +221,9 @@ SUMMARY: <one-line segment summary>
                     timeout=600,
                 )
                 response.raise_for_status()
-                content = self._extract_content(response.json())
+                resp_json = response.json()
+                content = self._extract_content(resp_json)
+                usage = self._extract_usage(resp_json)
                 per_frame, summary = self._parse_chunk_response(content, frame_indices)
 
                 results.append(
@@ -230,6 +237,23 @@ SUMMARY: <one-line segment summary>
                 )
                 if summary:
                     seed = summary
+
+                if on_chunk is not None:
+                    try:
+                        on_chunk({
+                            "chunk_id": chunk_id,
+                            "chunk_index": len(results) - 1,
+                            "n_total": n_total,
+                            "n_images": len(images_b64),
+                            "prompt_tokens": usage["prompt_tokens"],
+                            "completion_tokens": usage["completion_tokens"],
+                            "total_tokens": usage["total_tokens"],
+                            "n_ctx": n_ctx,
+                            "elapsed_s": round(time.time() - t0, 2),
+                            "ok": True,
+                        })
+                    except Exception as cb_e:
+                        self.logger.warning(f"on_chunk callback failed: {cb_e}")
             except Exception as e:
                 self.logger.warning(f"Chunk {chunk_id} failed: {e}")
                 results.append(
@@ -241,6 +265,23 @@ SUMMARY: <one-line segment summary>
                         raw_response="",
                     )
                 )
+                if on_chunk is not None:
+                    try:
+                        on_chunk({
+                            "chunk_id": chunk_id,
+                            "chunk_index": len(results) - 1,
+                            "n_total": n_total,
+                            "n_images": 0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                            "n_ctx": n_ctx,
+                            "elapsed_s": round(time.time() - t0, 2),
+                            "ok": False,
+                            "error": str(e),
+                        })
+                    except Exception:
+                        pass
 
         return results
 
@@ -288,6 +329,26 @@ SUMMARY: <one-line segment summary>
             return response.status_code == 200
         except Exception:
             return False
+
+    def get_n_ctx(self) -> Optional[int]:
+        """Read the server's configured context window from /props."""
+        try:
+            r = requests.get(f"{self.base_url}/props", timeout=5)
+            r.raise_for_status()
+            return int(
+                r.json().get("default_generation_settings", {}).get("n_ctx") or 0
+            ) or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_usage(result: dict) -> Dict[str, int]:
+        u = result.get("usage") or {}
+        return {
+            "prompt_tokens": int(u.get("prompt_tokens", 0)),
+            "completion_tokens": int(u.get("completion_tokens", 0)),
+            "total_tokens": int(u.get("total_tokens", 0)),
+        }
 
     def cleanup(self):
         pass
