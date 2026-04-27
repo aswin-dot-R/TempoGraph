@@ -59,6 +59,7 @@ class PipelineV2:
         vlm_autostart_timeout_s: float = 90.0,
         vlm_autostop: bool = False,
         vlm_frame_mode: str = "scored",
+        vlm_dedup_threshold: float = 0.92,
         audio_enabled: bool = False,
         whisper_model: str = "base.en",
         whisper_binary: Optional[str] = None,
@@ -92,6 +93,7 @@ class PipelineV2:
                 f"vlm_frame_mode must be 'scored' or 'keyframes', got {vlm_frame_mode!r}"
             )
         self.vlm_frame_mode = vlm_frame_mode
+        self.vlm_dedup_threshold = vlm_dedup_threshold
         self.audio_enabled = audio_enabled
         self.whisper_model = whisper_model
         self.whisper_binary = whisper_binary
@@ -326,6 +328,27 @@ class PipelineV2:
                     vlm_frames=len(vlm_frames),
                 )
 
+            # Stage 4.5: deduplicate visually redundant VLM frames
+            if self.vlm_dedup_threshold > 0 and len(vlm_frames) > 1:
+                pre_dedup = len(vlm_frames)
+                vlm_frames = self._deduplicate_vlm_frames(
+                    vlm_frames, out_dir / "frames",
+                )
+                dropped = pre_dedup - len(vlm_frames)
+                if dropped:
+                    self.logger.info(
+                        f"VLM dedup: {pre_dedup} → {len(vlm_frames)} "
+                        f"(dropped {dropped} redundant frames, "
+                        f"threshold={self.vlm_dedup_threshold})"
+                    )
+                    self._stage(
+                        "VLM dedup", "done",
+                        before=pre_dedup,
+                        after=len(vlm_frames),
+                        dropped=dropped,
+                        threshold=self.vlm_dedup_threshold,
+                    )
+
             if self.skip_vlm:
                 self._stage("VLM captioning", "skipped", reason="skip_vlm flag")
                 self._stage("Aggregation", "skipped", reason="skip_vlm flag")
@@ -467,6 +490,43 @@ class PipelineV2:
         except ValueError:
             return 0.0
 
+    def _deduplicate_vlm_frames(
+        self, vlm_frames: List[int], frames_dir: Path,
+    ) -> List[int]:
+        """Remove visually redundant frames from the VLM set.
+
+        Compares consecutive frames as 64×64 grayscale thumbnails.
+        Drops a frame if its similarity to the previous kept frame
+        exceeds ``vlm_dedup_threshold``.
+        """
+        kept: List[int] = [vlm_frames[0]]
+        prev_thumb = self._load_thumb(frames_dir / f"frame_{vlm_frames[0]:06d}.jpg")
+        if prev_thumb is None:
+            return vlm_frames
+
+        for idx in vlm_frames[1:]:
+            thumb = self._load_thumb(frames_dir / f"frame_{idx:06d}.jpg")
+            if thumb is None:
+                kept.append(idx)
+                continue
+            diff = cv2.absdiff(prev_thumb, thumb)
+            mean_diff = cv2.mean(diff)[0] / 255.0
+            similarity = 1.0 - mean_diff
+            if similarity < self.vlm_dedup_threshold:
+                kept.append(idx)
+                prev_thumb = thumb
+
+        return kept
+
+    @staticmethod
+    def _load_thumb(path: Path, size=(64, 64)):
+        """Load an image as a small grayscale thumbnail for fast comparison."""
+        img = cv2.imread(str(path))
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, size)
+
     def _extract_and_save_frames(self, indices, out_dir: Path) -> List[Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
         cap = cv2.VideoCapture(self.config.video_path)
@@ -532,6 +592,10 @@ if __name__ == "__main__":
              "keyframes: only motion-detected keyframes from FrameSelector "
              "(--vlm-fps ignored).",
     )
+    parser.add_argument("--vlm-dedup-threshold", type=float, default=0.92,
+                        help="Similarity threshold for VLM frame dedup "
+                             "(0.0–1.0, higher = more aggressive). "
+                             "Set to 0 to disable. Default 0.92.")
     parser.add_argument("--audio", action="store_true",
                         help="Transcribe audio with whisper.cpp")
     parser.add_argument("--whisper-model", default="base.en",
@@ -570,6 +634,7 @@ if __name__ == "__main__":
         vlm_autostart_service=args.vlm_autostart_service,
         vlm_autostop=args.vlm_autostop,
         vlm_frame_mode=args.vlm_frame_mode,
+        vlm_dedup_threshold=args.vlm_dedup_threshold,
         audio_enabled=args.audio,
         whisper_model=args.whisper_model,
         whisper_binary=args.whisper_binary,

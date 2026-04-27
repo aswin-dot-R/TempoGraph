@@ -125,6 +125,15 @@ def main():
         help="Ignored in keyframes-only mode.",
     )
     chunk_size = st.sidebar.slider("Frames per chunk", 4, 16, 10, 1)
+    vlm_dedup_threshold = st.sidebar.slider(
+        "Frame dedup threshold",
+        0.0, 1.0, 0.92, 0.01,
+        help="Drop VLM frames whose similarity to the previous kept frame "
+             "exceeds this value (64×64 grayscale thumbnail diff). "
+             "Higher = more aggressive dedup. 0 = disabled. "
+             "Default 0.92 eliminates near-identical frames that produce "
+             "'(no change)' VLM responses.",
+    )
     keep_vlm_running = st.sidebar.checkbox(
         "Keep VLM running after this video",
         value=False,
@@ -163,6 +172,7 @@ def main():
             threshold_mult=threshold_mult,
             keep_vlm_running=keep_vlm_running,
             vlm_frame_mode=vlm_frame_mode,
+            vlm_dedup_threshold=vlm_dedup_threshold,
             audio_enabled=audio_enabled,
             whisper_model=whisper_model,
             whisper_device=whisper_device,
@@ -241,6 +251,7 @@ def _run_pipeline(
     threshold_mult,
     keep_vlm_running,
     vlm_frame_mode,
+    vlm_dedup_threshold,
     audio_enabled,
     whisper_model,
     whisper_device,
@@ -464,6 +475,7 @@ def _run_pipeline(
                 vlm_autostart_service="qwen35-turboquant.service",
                 vlm_autostop=not keep_vlm_running,
                 vlm_frame_mode=vlm_frame_mode,
+                vlm_dedup_threshold=vlm_dedup_threshold,
                 audio_enabled=audio_enabled,
                 whisper_model=whisper_model,
                 whisper_gpu_device=(None if whisper_device == -1 else whisper_device),
