@@ -62,6 +62,25 @@ except ImportError:
     _TORCH_AVAILABLE = False
 
 
+class _DepthAnythingPipelineAdapter:
+    """Wraps transformers depth-estimation pipeline to match DepthAnythingV2.infer_image."""
+
+    def __init__(self, pipe):
+        self._pipe = pipe
+
+    def infer_image(self, raw_bgr: np.ndarray) -> np.ndarray:
+        from PIL import Image
+
+        rgb = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB)
+        result = self._pipe(Image.fromarray(rgb))
+        depth_t = result["predicted_depth"]
+        depth = depth_t.squeeze().detach().cpu().numpy().astype(np.float32)
+        h, w = raw_bgr.shape[:2]
+        if depth.shape != (h, w):
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+        return depth
+
+
 class DepthEstimator:
     def __init__(self, model_variant: str = "vits", device: str = "cuda"):
         self.model_variant = model_variant
@@ -69,75 +88,33 @@ class DepthEstimator:
         self.logger = logging.getLogger(__name__)
         self._model = None
 
+    _HF_REPOS = {
+        "vits": "depth-anything/Depth-Anything-V2-Small-hf",
+        "vitb": "depth-anything/Depth-Anything-V2-Base-hf",
+        "vitl": "depth-anything/Depth-Anything-V2-Large-hf",
+    }
+
     def _load_model(self):
-        """Lazy load Depth Anything V2 model."""
+        """Lazy-load Depth Anything V2 via the transformers pipeline."""
         if self._model is not None:
             return
 
-        self.logger.info(f"Loading Depth Anything V2 ({self.model_variant})")
-
         try:
-            from depth_anything_v2.dpt import DepthAnythingV2
+            from transformers import pipeline
         except ImportError as e:
             raise ImportError(
-                "depth_anything_v2 not installed. "
-                "Install with: pip install depth-anything-v2"
+                "transformers is required for depth estimation"
             ) from e
 
-        # Model config
-        model_configs = {
-            "vits": {
-                "encoder": "vits",
-                "features": 64,
-                "out_channels": [48, 96, 192, 384],
-            },
-        }
+        repo = self._HF_REPOS.get(self.model_variant, self._HF_REPOS["vits"])
+        self.logger.info(f"Loading Depth Anything V2 ({self.model_variant}) from {repo}")
 
-        # Load model
-        self._model = DepthAnythingV2(**model_configs[self.model_variant])
-
-        # Load weights
-        weights_path = self._get_weights_path()
-        self._model.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
-
-        # Move to device
-        self._model = self._model.to(self.device).eval()
-
+        device_arg = (
+            0 if (self.device == "cuda" and _TORCH_AVAILABLE and torch.cuda.is_available()) else -1
+        )
+        pipe = pipeline("depth-estimation", model=repo, device=device_arg)
+        self._model = _DepthAnythingPipelineAdapter(pipe)
         self.logger.info("Depth model loaded successfully")
-
-    def _get_weights_path(self) -> str:
-        """Get path to model weights."""
-        # Try common locations
-        possible_paths = [
-            "checkpoints/depth_anything_v2_vits.pth",
-            "depth_anything_v2_vits.pth",
-            os.path.join(
-                os.path.dirname(__file__), "checkpoints", "depth_anything_v2_vits.pth"
-            ),
-        ]
-
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-
-        # Try to download from HuggingFace
-        self.logger.warning("Weights not found. Attempting to download...")
-        try:
-            from huggingface_hub import hf_hub_download
-
-            weights_path = hf_hub_download(
-                repo_id="depth-anything/Depth-Anything-V2-Small",
-                filename="depth_anything_v2_vits.pth",
-                local_dir="checkpoints",
-            )
-            self.logger.info(f"Weights downloaded to: {weights_path}")
-            return weights_path
-        except Exception as e:
-            raise FileNotFoundError(
-                f"Depth model weights not found at any location. "
-                f"Please download from: https://huggingface.co/depth-anything/Depth-Anything-V2-Small\n"
-                f"Error: {e}"
-            ) from e
 
     def estimate_frames(
         self, frame_paths: List[Path], output_dir: str = "/tmp/tempograph_depth"

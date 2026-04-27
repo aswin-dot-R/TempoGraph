@@ -1,13 +1,10 @@
 """
-LLaMA Server backend for TempoGraph.
+llama.cpp llama-server backend for TempoGraph.
 
-Uses Ollama native API to offload model inference to an external server.
-
-Usage:
-1. Start Ollama: ollama serve
-2. Pull model: ollama pull qwen3-vl:4b
-
-The server handles VRAM management and model loading.
+Talks to a llama.cpp server over its OpenAI-compatible HTTP API
+(`/v1/chat/completions`, `/v1/models`), with multimodal image content
+sent as `image_url` data URIs and Qwen3 reasoning disabled via
+`chat_template_kwargs.enable_thinking=false`.
 """
 
 import base64
@@ -46,34 +43,67 @@ Output the JSON now:"""
 class LlamaServerBackend(BaseVLMBackend):
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
-        model: str = "qwen3-vl:4b",
+        base_url: str = "http://127.0.0.1:8082",
+        model: str = "Qwen3.5-9B-Q8_0.gguf",
         max_frames: int = 16,
         temperature: float = 0.1,
         max_tokens: int = 4096,
+        enable_thinking: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.max_frames = max_frames
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.enable_thinking = enable_thinking
         self.logger = logging.getLogger(__name__)
         self.parser = JSONParser()
 
     def _encode_image(self, image_path: Path) -> str:
-        """Encode image to base64."""
         with open(image_path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
 
     def _subsample_frames(self, frames: List[Path]) -> List[Path]:
-        """Uniformly subsample frames to max_frames."""
         if len(frames) <= self.max_frames:
             return frames
-
         indices = [
             int(i * len(frames) / self.max_frames) for i in range(self.max_frames)
         ]
         return [frames[i] for i in indices]
+
+    def _build_content(self, prompt: str, images_b64: List[str]) -> List[dict]:
+        items: List[dict] = [{"type": "text", "text": prompt}]
+        for b64 in images_b64:
+            items.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                }
+            )
+        return items
+
+    def _build_payload(self, prompt: str, images_b64: List[str]) -> dict:
+        return {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": self._build_content(prompt, images_b64),
+                }
+            ],
+        }
+
+    @staticmethod
+    def _extract_content(result: dict) -> str:
+        choices = result.get("choices") or []
+        if not choices:
+            return ""
+        msg = choices[0].get("message", {}) or {}
+        return msg.get("content") or ""
 
     def analyze_video(
         self,
@@ -82,8 +112,7 @@ class LlamaServerBackend(BaseVLMBackend):
         audio_path: Optional[str] = None,
         prompt: Optional[str] = None,
     ) -> AnalysisResult:
-        """Send frames to Ollama for analysis using native API."""
-        self.logger.info(f"Analyzing video with Ollama: {self.base_url}")
+        self.logger.info(f"Analyzing video with llama-server: {self.base_url}")
 
         if frames is None:
             raise ValueError("frames must be provided for llama server backend")
@@ -93,36 +122,19 @@ class LlamaServerBackend(BaseVLMBackend):
 
         analysis_prompt = prompt or ANALYSIS_PROMPT
 
-        # Build content with images using Ollama native format
-        images = []
+        images_b64: List[str] = []
         for frame_path in frame_paths:
             try:
-                image_base64 = self._encode_image(Path(frame_path))
-                images.append(image_base64)
+                images_b64.append(self._encode_image(Path(frame_path)))
             except Exception as e:
                 self.logger.warning(f"Failed to encode frame {frame_path}: {e}")
 
-        # Use Ollama native API
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": analysis_prompt,
-                    "images": images,
-                }
-            ],
-            "stream": False,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens,
-            },
-        }
+        payload = self._build_payload(analysis_prompt, images_b64)
 
         try:
             start_time = time.time()
             response = requests.post(
-                f"{self.base_url}/api/chat",
+                f"{self.base_url}/v1/chat/completions",
                 json=payload,
                 timeout=600,
             )
@@ -130,7 +142,7 @@ class LlamaServerBackend(BaseVLMBackend):
             inference_time = time.time() - start_time
 
             result = response.json()
-            response_text = result.get("message", {}).get("content", "")
+            response_text = self._extract_content(result)
 
             self.logger.info(
                 f"Got response ({len(response_text)} chars) in {inference_time:.2f}s"
@@ -148,10 +160,10 @@ class LlamaServerBackend(BaseVLMBackend):
             return analysis
 
         except requests.exceptions.ConnectionError as e:
-            self.logger.error(f"Failed to connect to Ollama: {e}")
+            self.logger.error(f"Failed to connect to llama-server: {e}")
             raise RuntimeError(
-                f"Could not connect to Ollama at {self.base_url}. "
-                "Make sure Ollama is running: ollama serve"
+                f"Could not connect to llama-server at {self.base_url}. "
+                "Make sure the llama.cpp server is running and reachable."
             ) from e
         except Exception as e:
             self.logger.error(f"Error during analysis: {e}")
@@ -177,14 +189,13 @@ SUMMARY: <one-line segment summary>
         chunks: List[Tuple[int, List[int]]],
         db,
     ) -> List[ChunkCaption]:
-        """Caption each chunk; previous chunk's summary becomes the seed for the next."""
         seed = "this is the start"
         results: List[ChunkCaption] = []
 
         for chunk_id, frame_indices in chunks:
             try:
-                images_b64 = []
-                frame_lines = []
+                images_b64: List[str] = []
+                frame_lines: List[str] = []
                 for fidx in frame_indices:
                     frow = db.get_frame(fidx)
                     if not frow:
@@ -198,22 +209,14 @@ SUMMARY: <one-line segment summary>
                 prompt = self.CHUNK_PROMPT_TEMPLATE.format(
                     seed=seed, frame_block="\n".join(frame_lines)
                 )
-                payload = {
-                    "model": self.model,
-                    "messages": [
-                        {"role": "user", "content": prompt, "images": images_b64}
-                    ],
-                    "stream": False,
-                    "options": {
-                        "temperature": self.temperature,
-                        "num_predict": self.max_tokens,
-                    },
-                }
+                payload = self._build_payload(prompt, images_b64)
                 response = requests.post(
-                    f"{self.base_url}/api/chat", json=payload, timeout=600
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                    timeout=600,
                 )
                 response.raise_for_status()
-                content = response.json().get("message", {}).get("content", "")
+                content = self._extract_content(response.json())
                 per_frame, summary = self._parse_chunk_response(content, frame_indices)
 
                 results.append(
@@ -280,15 +283,13 @@ SUMMARY: <one-line segment summary>
         return per_frame, summary
 
     def is_available(self) -> bool:
-        """Check if server is running."""
         try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            response = requests.get(f"{self.base_url}/v1/models", timeout=5)
             return response.status_code == 200
         except Exception:
             return False
 
     def cleanup(self):
-        """No local resources to clean up."""
         pass
 
     @property

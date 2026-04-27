@@ -34,7 +34,17 @@ CREATE TABLE IF NOT EXISTS depth_frames (
     FOREIGN KEY (frame_idx) REFERENCES frames(frame_idx)
 );
 
+CREATE TABLE IF NOT EXISTS audio_segments (
+    segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    no_speech_prob REAL,
+    avg_logprob REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_det_frame ON detections(frame_idx);
+CREATE INDEX IF NOT EXISTS idx_audio_start ON audio_segments(start_ms);
 """
 
 
@@ -101,6 +111,11 @@ class TempoGraphDB:
         self._conn.commit()
         return cur.lastrowid
 
+    def count_detections(self) -> int:
+        return int(
+            self._conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+        )
+
     def get_detections_for_frame(self, frame_idx: int) -> list:
         rows = self._conn.execute(
             "SELECT * FROM detections WHERE frame_idx = ? ORDER BY detection_id ASC",
@@ -128,6 +143,34 @@ class TempoGraphDB:
             (frame_idx,),
         ).fetchone()
         return row["depth_npy_path"] if row else None
+
+    def insert_audio_segment(
+        self,
+        start_ms: int,
+        end_ms: int,
+        text: str,
+        no_speech_prob: Optional[float] = None,
+        avg_logprob: Optional[float] = None,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO audio_segments "
+            "(start_ms, end_ms, text, no_speech_prob, avg_logprob) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (start_ms, end_ms, text, no_speech_prob, avg_logprob),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def get_audio_segments(self) -> list:
+        rows = self._conn.execute(
+            "SELECT * FROM audio_segments ORDER BY start_ms ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_audio_segments(self) -> int:
+        return int(
+            self._conn.execute("SELECT COUNT(*) FROM audio_segments").fetchone()[0]
+        )
 
     def close(self) -> None:
         self._conn.close()

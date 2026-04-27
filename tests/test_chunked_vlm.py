@@ -22,8 +22,8 @@ def test_caption_chunks_propagates_seed(tmp_path):
         paths.append(p)
 
     fake_responses = [
-        {"message": {"content": "FRAME_0: a starts\nFRAME_1: a continues\nSUMMARY: agent A walking right"}},
-        {"message": {"content": "FRAME_10: b appears\nSUMMARY: agent B has joined"}},
+        {"choices": [{"message": {"content": "FRAME_0: a starts\nFRAME_1: a continues\nSUMMARY: agent A walking right"}}]},
+        {"choices": [{"message": {"content": "FRAME_10: b appears\nSUMMARY: agent B has joined"}}]},
     ]
     with patch("src.backends.llama_server_backend.requests.post") as mock_post:
         mock_post.side_effect = [MagicMock(json=MagicMock(return_value=r), raise_for_status=MagicMock()) for r in fake_responses]
@@ -41,7 +41,8 @@ def test_caption_chunks_propagates_seed(tmp_path):
 
     # Second call must include the first call's summary as the seed
     second_call_payload = mock_post.call_args_list[1].kwargs["json"]
-    second_prompt = second_call_payload["messages"][0]["content"]
+    second_content = second_call_payload["messages"][0]["content"]
+    second_prompt = next(item["text"] for item in second_content if item["type"] == "text")
     assert "agent A walking right" in second_prompt
 
 
