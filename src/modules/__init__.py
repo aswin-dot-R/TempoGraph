@@ -1,6 +1,8 @@
-"""Modules package for TempoGraph."""
+"""Modules package for TempoGraph v2."""
 
-from .frame_extractor import FrameExtractor, ExtractionResult
+from .frame_selector import FrameSelector
+from .frame_scorer import FrameScorer
+from .whisper_cpp import WhisperCppTranscriber
 
 try:
     from .detector import ObjectDetector
@@ -12,18 +14,10 @@ try:
 except ImportError:
     DepthEstimator = None  # type: ignore[assignment,misc]
 
-try:
-    from .audio import AudioAnalyzer
-except ImportError:
-    AudioAnalyzer = None  # type: ignore[assignment,misc]
-
-from .frame_selector import FrameSelector
-
 __all__ = [
-    "FrameExtractor",
-    "ExtractionResult",
+    "FrameSelector",
+    "FrameScorer",
+    "WhisperCppTranscriber",
     "ObjectDetector",
     "DepthEstimator",
-    "AudioAnalyzer",
-    "FrameSelector",
 ]

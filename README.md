@@ -2,51 +2,65 @@
 
 **Turn video into structured entities, events, captions, transcripts, and graphs.**
 
-TempoGraph is a multimodal video-analysis pipeline. Two generations live side
-by side in the repo, but **v2 is the active path** — that's what the
-Streamlit UI runs and what this README covers.
+TempoGraph is a fully-local multimodal video-analysis pipeline. YOLO + Depth
+Anything V2 + Whisper.cpp + Qwen3.5-VL, glued together by a chunked
+orchestrator that persists everything to a per-run SQLite store, with a
+Streamlit UI for both kicking off runs and browsing past results.
 
-> **Looking for the deep technical doc?** Every stage, every knob, every
-> output file, every API call we make — see
-> [`docs/PIPELINE.md`](docs/PIPELINE.md). This README is the quickstart;
-> that doc is the source of truth. The legacy
-`src/pipeline.py` path is still importable for the Gemini cloud backend; see
-[Legacy pipeline](#legacy-pipeline) at the bottom.
+> **Quick install: see [`QUICKSTART.md`](QUICKSTART.md).**
+> **Deep technical doc: see [`docs/PIPELINE.md`](docs/PIPELINE.md)** — every
+> stage, every knob, every output file, every API call we make. This README
+> is the architecture overview; that doc is the source of truth.
 
 ---
 
-## Hardware setup this README assumes
+## One-line install
 
-This code is configured for an ASUS TUF FX707ZM laptop with **two discrete GPUs**:
+```bash
+git clone https://github.com/aswin-dot-R/TempoGraph.git && cd TempoGraph && make install
+```
+
+What happens: detects your Python env, installs deps, clones + builds
+`whisper.cpp` (Vulkan / CUDA / CPU auto-detected), downloads the
+`base.en` whisper model, and writes `.streamlit/config.toml` with a
+4 GB upload cap. Idempotent — safe to re-run.
+
+For the local LLM (~10 GB more): `make install-llm`. See
+[`QUICKSTART.md`](QUICKSTART.md) for details.
+
+---
+
+## Hardware split (recommended)
+
+The pipeline is designed around two discrete GPUs but works fine with one:
 
 | GPU | Role | Used by |
 |---|---|---|
-| NVIDIA RTX 3060 Mobile (6 GiB) | CUDA + Vulkan | YOLO, Depth Anything V2, Whisper.cpp |
-| AMD Radeon RX 9070 XT (16 GiB) | ROCm/HIP | llama.cpp / Qwen3.5-VL captioning |
+| NVIDIA / CUDA + Vulkan | Vision + ASR | YOLO, Depth Anything V2, Whisper.cpp |
+| AMD ROCm/HIP **or** any Vulkan GPU | LLM serving | llama.cpp / Qwen3.5-VL captioning |
 
-Plus an Intel Iris Xe iGPU (used by the desktop, not by the pipeline).
-
-The split is intentional — the AMD card is dedicated to LLM serving, the
-NVIDIA card handles all torch/Vulkan compute. They never contend.
+The split is intentional — the LLM-serving GPU loads the 9 B Qwen
+weights once and stays warm; the vision GPU handles all the torch +
+Vulkan compute that runs sequentially per-frame. With a single GPU, the
+pipeline serializes — qwen autostarts before VLM stage and autostops
+after, so it doesn't fight with YOLO/Depth for VRAM.
 
 ---
 
-## Quick start
+## Run it
 
 ```bash
-# 1. Activate the conda env that has torch+CUDA installed
-conda activate msd        # or use absolute path:
-                          # /home/ashie/anaconda3/envs/msd/bin/python
-
-# 2. Launch the UI (auto-starts the qwen LLM service on demand)
-cd /home/ashie/TempoGraph
-streamlit run ui/app.py
+make run        # Streamlit UI on http://localhost:8501
 ```
 
-Open `http://localhost:8501`, upload a video, click **Run full pipeline**.
+Drag a video in, tweak the sidebar, click **Run full pipeline**. Every
+external service (qwen LLM, Whisper, model weights) is pulled / started
+on demand.
 
-That's it — every external service (qwen LLM, Whisper, model weights)
-is pulled / started on demand.
+CLI equivalent:
+```bash
+make run-cli VIDEO=path/to/clip.mp4
+```
 
 ---
 
@@ -300,69 +314,43 @@ doesn't exist in modern torch (renamed to `total_memory`).
 
 ```text
 TempoGraph/
+├── Makefile                          # install / run / test targets
+├── bootstrap.sh                      # one-shot installer
+├── QUICKSTART.md                     # 1-line install guide
+├── README.md
+├── docs/PIPELINE.md                  # deep technical doc
+├── AGENTS.md                         # coding standards for agents
+├── requirements.txt
+├── .streamlit/config.toml            # 4 GB upload cap, telemetry off
 ├── src/
-│   ├── pipeline.py                    # legacy multi-backend pipeline
-│   ├── pipeline_v2.py                 # active orchestrator
-│   ├── aggregator.py                  # chunk → analysis.json (also takes transcript)
-│   ├── runtime_estimator.py           # ETA model used by the UI
-│   ├── api.py                         # FastAPI (still wired to legacy pipeline)
+│   ├── pipeline_v2.py                # orchestrator
+│   ├── aggregator.py                 # chunk → analysis.json (also takes transcript)
+│   ├── runtime_estimator.py          # ETA model used by the UI
+│   ├── batch_runner.py               # batch every video in a directory
+│   ├── dataset_exporter.py           # COCO + JSONL dataset export
 │   ├── graph_builder.py
 │   ├── json_parser.py
 │   ├── models.py
-│   ├── storage.py                     # SQLite schema + helpers
-│   ├── video_annotator.py
+│   ├── storage.py                    # SQLite schema + helpers
 │   ├── backends/
 │   │   ├── base.py
-│   │   ├── gemini_backend.py
-│   │   ├── llama_server_backend.py    # → llama.cpp /v1/chat/completions
-│   │   └── qwen_backend.py            # legacy local Qwen via transformers
+│   │   └── llama_server_backend.py   # → llama.cpp /v1/chat/completions
 │   └── modules/
-│       ├── audio.py                   # legacy openai-whisper wrapper
-│       ├── depth.py                   # transformers depth-anything-v2
-│       ├── detector.py                # ultralytics YOLO
-│       ├── frame_extractor.py         # legacy adaptive extractor
-│       ├── frame_scorer.py            # v2 top-K scorer
-│       ├── frame_selector.py          # v2 motion-aware selector
-│       └── whisper_cpp.py             # whisper.cpp subprocess wrapper
+│       ├── depth.py                  # transformers depth-anything-v2
+│       ├── detector.py               # ultralytics YOLO26
+│       ├── frame_scorer.py           # top-K scorer
+│       ├── frame_selector.py         # motion-aware selector
+│       └── whisper_cpp.py            # whisper.cpp subprocess wrapper
 ├── ui/
-│   ├── app.py                         # main pipeline page (Streamlit)
+│   ├── app.py                        # main pipeline page (Streamlit)
 │   └── pages/
-│       └── Results.py                 # results browser (Streamlit)
+│       └── Results.py                # results browser (Streamlit)
 ├── scripts/
-│   └── smoke_test_v2.py               # end-to-end pipeline smoke test
+│   └── smoke_test_v2.py              # end-to-end pipeline smoke test
 ├── tools/
-│   └── make_test_video.py             # synthetic-video generator
-├── tests/
-├── configs/
-├── docs/
-├── .streamlit/config.toml             # 4 GB upload cap, telemetry off
-├── docker-compose.yml
-├── requirements.txt
-├── README.md
-└── AGENTS.md
+│   └── make_test_video.py            # synthetic-video generator
+└── tests/
 ```
-
----
-
-## Legacy pipeline
-
-`src/pipeline.py` and `src/api.py` still exist and run the older flow:
-
-```bash
-python -m src.pipeline --video clip.mp4 --backend gemini --output results/legacy
-python -m src.pipeline --video clip.mp4 --backend qwen --modules behavior,detection,audio
-```
-
-It uses `src/modules/frame_extractor.py` (adaptive extraction), the legacy
-`src/modules/audio.py` (openai-whisper Python lib, not whisper.cpp), and
-the multi-backend dispatcher in `Pipeline._make_backend()`. The Streamlit
-UI does **not** route to this path — it's only reachable via CLI or
-`uvicorn src.api:app`.
-
-The Gemini path is still the only one in the repo that handles audio +
-video natively in a single LLM call (Qwen3.5-VL is image-only via
-llama.cpp's mtmd plugin; the v2 path multiplexes by sending images +
-transcript text separately and letting the aggregator stitch them).
 
 ## License
 

@@ -2,22 +2,41 @@
 
 ## Overview
 
-TempoGraph is a multimodal video analysis pipeline that extracts temporal behaviors, interactions, and correlations from video content using AI models. It supports dual backends: cloud (Gemini) and local (Qwen2.5-VL-3B).
+TempoGraph is a fully-local multimodal video analysis pipeline. It extracts
+temporal behaviors, interactions, audio transcripts, and cross-modal
+correlations from video using YOLO + Depth Anything V2 + Whisper.cpp +
+Qwen3.5-VL (served by llama.cpp), persisted to a per-run SQLite store with
+a Streamlit UI for both running the pipeline and browsing past results.
+
+See `README.md` for a high-level overview and `docs/PIPELINE.md` for the
+deep technical doc with every stage and knob.
 
 ## Project Structure
 
 ```
 TempoGraph/
 ├── src/
-│   ├── backends/          # VLM backends (base.py, gemini_backend.py, qwen_backend.py)
-│   ├── modules/           # Analysis modules (audio.py, depth.py, detector.py, frame_extractor.py)
-│   ├── models.py          # Pydantic data models
-│   ├── pipeline.py        # Main pipeline orchestrator
-│   ├── json_parser.py     # JSON parsing utilities
-│   ├── graph_builder.py   # NetworkX graph builder
-│   └── video_annotator.py # Video annotation
+│   ├── pipeline_v2.py        # orchestrator (the only pipeline)
+│   ├── aggregator.py         # chunk → analysis.json
+│   ├── batch_runner.py       # run pipeline over a directory of videos
+│   ├── dataset_exporter.py   # COCO + JSONL dataset export
+│   ├── runtime_estimator.py  # ETA model used by the UI
+│   ├── storage.py            # SQLite schema + helpers
+│   ├── graph_builder.py      # NetworkX → pyvis HTML
+│   ├── json_parser.py        # lenient LLM-JSON extractor
+│   ├── models.py             # Pydantic data models
+│   ├── backends/
+│   │   ├── base.py
+│   │   └── llama_server_backend.py  # → llama.cpp /v1/chat/completions
+│   └── modules/
+│       ├── frame_selector.py        # motion-aware frame sampler
+│       ├── frame_scorer.py          # top-K scorer for VLM frame pick
+│       ├── detector.py              # ultralytics YOLO26
+│       ├── depth.py                 # transformers Depth Anything V2
+│       └── whisper_cpp.py           # subprocess wrapper for whisper.cpp
 ├── ui/
-│   └── app.py             # Streamlit UI
+│   ├── app.py                # main pipeline page (Streamlit)
+│   └── pages/Results.py      # results browser (Streamlit)
 ├── tests/
 │   ├── test_parser.py     # JSON parser unit tests
 │   └── test_vram_budget.py # VRAM verification test
@@ -61,20 +80,23 @@ black --check src/ tests/
 flake8 src/ tests/
 
 # Lint specific file
-flake8 src/pipeline.py
+flake8 src/pipeline_v2.py
 ```
 
 ### Running the Pipeline
 
 ```bash
-# Cloud mode with Gemini
-python -m src.pipeline --video sample.mp4 --backend gemini
+# Streamlit UI (the recommended path)
+make run
 
-# Local mode with Qwen
-python -m src.pipeline --video sample.mp4 --backend qwen --modules behavior,detection,audio
+# CLI on a single video
+make run-cli VIDEO=clip.mp4
 
-# Streamlit UI
-streamlit run ui/app.py
+# Bulk: process every video in a directory
+python -m src.batch_runner --video-dir videos/ --output-dir results/
+
+# Skip-VLM smoke test (synthetic 10s video)
+make smoke
 ```
 
 ### Installation
