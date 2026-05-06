@@ -161,3 +161,71 @@ def format_seconds(s: float) -> str:
         h, m = divmod(m, 60)
         return f"{h:d}:{m:02d}:{sec:02d}"
     return f"{m:d}:{sec:02d}"
+
+
+# ── ETA calibration ──────────────────────────────────────────────
+
+
+import json
+from pathlib import Path
+
+CALIBRATION_FILE = Path("results/.calibration.jsonl")
+
+
+def record_stage_timing(
+    stage_name: str,
+    elapsed_s: float,
+    n_units: int,
+    video_path: str = "",
+) -> None:
+    """Append a stage timing entry to the calibration log.
+
+    Called after each stage completes. Over time this builds a history
+    that load_calibration() uses to improve ETA accuracy.
+    """
+    entry = {
+        "stage": stage_name,
+        "elapsed_s": round(elapsed_s, 2),
+        "n_units": n_units,
+        "video": video_path,
+    }
+    try:
+        CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CALIBRATION_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # non-critical
+
+
+def load_calibration(max_entries: int = 50) -> Dict[str, float]:
+    """Load per-unit cost estimates from calibration history.
+
+    Returns a dict mapping stage_name -> seconds_per_unit.
+    Only uses the most recent `max_entries` entries per stage.
+    """
+    if not CALIBRATION_FILE.exists():
+        return {}
+
+    entries: Dict[str, list] = {}
+    try:
+        with open(CALIBRATION_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                name = d.get("stage", "")
+                entries.setdefault(name, []).append(d)
+    except Exception:
+        return {}
+
+    result: Dict[str, float] = {}
+    for name, recs in entries.items():
+        recent = recs[-max_entries:]
+        valid = [(r["elapsed_s"], r["n_units"]) for r in recent if r.get("n_units", 0) > 0]
+        if valid:
+            total_time = sum(e for e, _ in valid)
+            total_units = sum(n for _, n in valid)
+            result[name] = total_time / total_units
+    return result
+

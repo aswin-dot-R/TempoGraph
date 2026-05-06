@@ -45,6 +45,26 @@ CREATE TABLE IF NOT EXISTS audio_segments (
 
 CREATE INDEX IF NOT EXISTS idx_det_frame ON detections(frame_idx);
 CREATE INDEX IF NOT EXISTS idx_audio_start ON audio_segments(start_ms);
+
+CREATE TABLE IF NOT EXISTS run_stages (
+    stage_name TEXT PRIMARY KEY,
+    finished_at TEXT NOT NULL,
+    elapsed_s REAL,
+    n_units INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ethogram_labels (
+    label_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    frame_idx INTEGER NOT NULL,
+    behavior TEXT NOT NULL,
+    confidence REAL,
+    note TEXT,
+    profile_name TEXT NOT NULL DEFAULT 'default',
+    FOREIGN KEY (frame_idx) REFERENCES frames(frame_idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ethogram_frame ON ethogram_labels(frame_idx);
+CREATE INDEX IF NOT EXISTS idx_ethogram_profile ON ethogram_labels(profile_name);
 """
 
 
@@ -171,6 +191,78 @@ class TempoGraphDB:
         return int(
             self._conn.execute("SELECT COUNT(*) FROM audio_segments").fetchone()[0]
         )
+
+    # ── stage tracking (crash-resume) ──────────────────────────────
+
+    def mark_stage_complete(
+        self, stage_name: str, elapsed_s: float = 0.0, n_units: int = 0,
+    ) -> None:
+        """Record that a pipeline stage finished successfully."""
+        from datetime import datetime
+        self._conn.execute(
+            "INSERT OR REPLACE INTO run_stages "
+            "(stage_name, finished_at, elapsed_s, n_units) VALUES (?, ?, ?, ?)",
+            (stage_name, datetime.utcnow().isoformat(), elapsed_s, n_units),
+        )
+        self._conn.commit()
+
+    def is_stage_complete(self, stage_name: str) -> bool:
+        """Check if a stage was previously completed."""
+        cur = self._conn.execute(
+            "SELECT stage_name FROM run_stages WHERE stage_name = ?",
+            (stage_name,),
+        )
+        return cur.fetchone() is not None
+
+    def clear_stages(self) -> None:
+        """Clear all stage completion records (fresh run)."""
+        self._conn.execute("DELETE FROM run_stages")
+        self._conn.commit()
+
+    # ── ethogram labels ────────────────────────────────────────────
+
+    def insert_ethogram_label(
+        self,
+        frame_idx: int,
+        behavior: str,
+        confidence: Optional[float] = None,
+        note: Optional[str] = None,
+        profile_name: str = "default",
+    ) -> int:
+        """Insert a per-frame ethogram behavior label."""
+        cur = self._conn.execute(
+            "INSERT INTO ethogram_labels "
+            "(frame_idx, behavior, confidence, note, profile_name) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (frame_idx, behavior, confidence, note, profile_name),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def get_ethogram_labels(self, profile_name: str = "default") -> list:
+        """Get all ethogram labels for a profile, ordered by frame index."""
+        rows = self._conn.execute(
+            "SELECT * FROM ethogram_labels WHERE profile_name = ? "
+            "ORDER BY frame_idx ASC",
+            (profile_name,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_ethogram_profile(self, profile_name: str = "default") -> int:
+        """Delete all labels for a given profile. Returns count deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM ethogram_labels WHERE profile_name = ?",
+            (profile_name,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def list_ethogram_profiles(self) -> list:
+        """List distinct ethogram profile names."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT profile_name FROM ethogram_labels ORDER BY profile_name"
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def close(self) -> None:
         self._conn.close()

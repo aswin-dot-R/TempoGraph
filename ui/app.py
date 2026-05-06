@@ -4,6 +4,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
 import tempfile
+import threading
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -106,10 +107,18 @@ def main():
     )
 
     st.sidebar.subheader("VLM Captioning (llama-server)")
+    skip_vlm = st.sidebar.checkbox(
+        "Skip VLM captioning (preprocess only)",
+        value=False,
+        help="Check this to run only frame extraction + YOLO detection "
+             "without the VLM summarisation stage. Useful for preparing "
+             "videos for Ethogram coding or quick preview.",
+    )
     vlm_frame_mode = st.sidebar.radio(
         "Frame source for VLM",
         options=["keyframes", "scored"],
         index=0,
+        disabled=skip_vlm,
         format_func=lambda m: {
             "keyframes": "Keyframes only (motion-detected)",
             "scored":    "Top-K scored at Caption FPS",
@@ -121,10 +130,10 @@ def main():
     )
     vlm_fps = st.sidebar.slider(
         "Caption FPS", 0.1, 2.0, 0.5, 0.1,
-        disabled=(vlm_frame_mode == "keyframes"),
+        disabled=(vlm_frame_mode == "keyframes" or skip_vlm),
         help="Ignored in keyframes-only mode.",
     )
-    chunk_size = st.sidebar.slider("Frames per chunk", 4, 16, 10, 1)
+    chunk_size = st.sidebar.slider("Frames per chunk", 4, 16, 10, 1, disabled=skip_vlm)
     vlm_dedup_threshold = st.sidebar.slider(
         "Frame dedup threshold",
         0.0, 1.0, 0.92, 0.01,
@@ -133,6 +142,22 @@ def main():
              "Higher = more aggressive dedup. 0 = disabled. "
              "Default 0.92 eliminates near-identical frames that produce "
              "'(no change)' VLM responses.",
+    )
+    dynamic_chunking = st.sidebar.checkbox(
+        "Dynamic chunking (auto context management)",
+        value=True,
+        help="When enabled, chunk sizes are auto-calculated based on actual "
+             "token usage and the context window compacts automatically "
+             "when approaching the threshold. Disabling uses fixed chunk sizes.",
+    )
+    context_threshold = st.sidebar.slider(
+        "Context compaction threshold",
+        0.50, 0.95, 0.80, 0.05,
+        disabled=not dynamic_chunking,
+        help="Fraction of n_ctx that triggers a hard compaction pass. "
+             "When cumulative prompt+completion tokens across chunks exceed "
+             "this threshold × n_ctx, the system summarises everything into "
+             "a 2-line seed and prunes the entity registry.",
     )
     keep_vlm_running = st.sidebar.checkbox(
         "Keep VLM running after this video",
@@ -145,22 +170,134 @@ def main():
     st.sidebar.subheader("Frame Selection")
     threshold_mult = st.sidebar.slider("Keyframe threshold (× σ)", 0.5, 3.0, 1.0, 0.1)
 
-    uploaded = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv"])
-    if uploaded is None:
-        return
+    # ── Video input: local path (primary) or small upload (fallback) ──
+    import os
+    import subprocess
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
-        f.write(uploaded.read())
-        video_path = f.name
+    st.markdown("#### Video input")
+    input_mode = st.radio(
+        "Source",
+        ["Local file path (recommended for large files)", "Upload (< 2 GB)"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    video_path = None
+    video_name = None
+
+    if input_mode.startswith("Local"):
+        local_path = st.text_input(
+            "Path to video file",
+            placeholder="/home/ashie/videos/camera0_4k.mkv",
+            help="Absolute path on your filesystem. "
+                 "No RAM overhead — the file is read directly by OpenCV/FFmpeg.",
+        )
+        if local_path and os.path.isfile(local_path):
+            video_name = os.path.basename(local_path)
+            ext = os.path.splitext(local_path)[1].lower()
+            # Remux non-MP4 or any file to fix broken timestamps
+            if ext != ".mp4":
+                fixed = os.path.join(
+                    tempfile.gettempdir(),
+                    os.path.splitext(video_name)[0] + "_fixed.mp4",
+                )
+                if not os.path.exists(fixed):
+                    with st.spinner(f"Remuxing {video_name} → MP4 (fast, no re-encode)..."):
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", local_path,
+                             "-c", "copy", "-fflags", "+genpts", fixed],
+                            capture_output=True,
+                        )
+                video_path = fixed
+            else:
+                video_path = local_path
+            st.success(f"✓ `{video_name}` — ready")
+        elif local_path:
+            st.error(f"File not found: `{local_path}`")
+    else:
+        uploaded = st.file_uploader(
+            "Upload video (< 2 GB)",
+            type=["mp4", "avi", "mov", "mkv"],
+        )
+        if uploaded is not None:
+            video_name = uploaded.name
+            ext = os.path.splitext(uploaded.name)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
+                f.write(uploaded.read())
+                raw_path = f.name
+            fixed = raw_path + "_fixed.mp4"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", raw_path,
+                 "-c", "copy", "-fflags", "+genpts", fixed],
+                capture_output=True,
+            )
+            video_path = fixed
+
+    if video_path is None:
+        return
 
     col1, col2 = st.columns(2)
     if col1.button("Preview frame selection"):
         _render_selection_preview(video_path, camera_mode, yolo_fps, threshold_mult)
 
+    # Check for existing run with same name
+    import shutil
+    run_dir = Path(f"results/{video_name}")
+    if run_dir.exists() and (run_dir / "tempograph.db").exists():
+        st.warning(f"⚠ A previous run for **{video_name}** already exists.")
+        # Show basic stats
+        try:
+            import sqlite3
+            with sqlite3.connect(str(run_dir / "tempograph.db")) as _c:
+                n_frames = _c.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
+                n_dets = _c.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+            from datetime import datetime
+            mtime = datetime.fromtimestamp(run_dir.stat().st_mtime).strftime("%b %d, %H:%M")
+            st.caption(
+                f"Previous run: {n_frames} frames, {n_dets} detections — last modified {mtime}"
+            )
+        except Exception:
+            pass
+
+        dup_col1, dup_col2, dup_col3 = st.columns(3)
+        if dup_col1.button("🗑 Delete previous & re-run", type="primary"):
+            shutil.rmtree(run_dir)
+            st.success("Previous run deleted. Click **Run full pipeline** again.")
+            st.rerun()
+        if dup_col2.button("📂 Keep both (append timestamp)"):
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            video_name = f"{os.path.splitext(video_name)[0]}_{ts}{os.path.splitext(video_name)[1]}"
+            st.info(f"New run will be saved as **{video_name}**")
+        if dup_col3.button("Run full pipeline (overwrite)", type="secondary"):
+            _run_pipeline(
+                video_path=video_path,
+                video_name=video_name,
+                camera_mode=camera_mode,
+                yolo_fps=yolo_fps,
+                vlm_fps=vlm_fps,
+                chunk_size=chunk_size,
+                confidence=confidence,
+                depth_enabled=depth_enabled,
+                use_seg=use_seg,
+                yolo_size=yolo_size,
+                threshold_mult=threshold_mult,
+                keep_vlm_running=keep_vlm_running,
+                vlm_frame_mode=vlm_frame_mode,
+                vlm_dedup_threshold=vlm_dedup_threshold,
+                dynamic_chunking=dynamic_chunking,
+                context_threshold=context_threshold,
+                skip_vlm=skip_vlm,
+                audio_enabled=audio_enabled,
+                whisper_model=whisper_model,
+                whisper_device=whisper_device,
+            )
+        return
+
     if col2.button("Run full pipeline", type="primary"):
         _run_pipeline(
             video_path=video_path,
-            video_name=uploaded.name,
+            video_name=video_name,
             camera_mode=camera_mode,
             yolo_fps=yolo_fps,
             vlm_fps=vlm_fps,
@@ -173,6 +310,9 @@ def main():
             keep_vlm_running=keep_vlm_running,
             vlm_frame_mode=vlm_frame_mode,
             vlm_dedup_threshold=vlm_dedup_threshold,
+            dynamic_chunking=dynamic_chunking,
+            context_threshold=context_threshold,
+            skip_vlm=skip_vlm,
             audio_enabled=audio_enabled,
             whisper_model=whisper_model,
             whisper_device=whisper_device,
@@ -252,6 +392,9 @@ def _run_pipeline(
     keep_vlm_running,
     vlm_frame_mode,
     vlm_dedup_threshold,
+    dynamic_chunking,
+    context_threshold,
+    skip_vlm,
     audio_enabled,
     whisper_model,
     whisper_device,
@@ -409,6 +552,11 @@ def _run_pipeline(
             unsafe_allow_html=True,
         )
 
+    cancel_event = threading.Event()
+    cancel_holder = st.empty()
+    if cancel_holder.button("❌ Cancel pipeline", disabled=False, key="cancel_btn"):
+        cancel_event.set()
+
     with st.status("Running v2 pipeline...", expanded=True) as status:
         try:
             stage_log = st.empty()
@@ -442,6 +590,51 @@ def _run_pipeline(
                     _render_ctx_panel()
                     return
 
+                # Progress events: update in-place (don't flood the log)
+                if event == "progress":
+                    progress_prefix = f"  ↳ {name}:"
+                    if name == "Frame selection":
+                        detail = (
+                            f"  ↳ Scanning: frame {info.get('frame', '?')}/{info.get('total', '?')}"
+                            f" — {info.get('scanned', 0)} sampled"
+                            f" @ {info.get('fps', 0)} fps"
+                            f" — ETA {info.get('eta_s', 0)}s"
+                        )
+                    elif name == "Frame export":
+                        detail = (
+                            f"  ↳ Saving JPEGs: {info.get('step', 0)}/{info.get('total', 0)}"
+                            f" @ {info.get('fps', 0)} fps"
+                            f" — ETA {info.get('eta_s', 0)}s"
+                        )
+                    elif name == "YOLO detection":
+                        detail = (
+                            f"  ↳ YOLO: {info.get('step', 0)}/{info.get('total', 0)} frames"
+                            f" — {info.get('detections', 0)} detections"
+                            f" @ {info.get('fps', 0)} fps"
+                            f" — ETA {info.get('eta_s', 0)}s"
+                        )
+                    else:
+                        bits = ", ".join(f"{k}={v}" for k, v in info.items())
+                        detail = f"  ↳ {name}: {bits}"
+
+                    # Replace last progress line if exists, else append
+                    if (
+                        stage_state["lines"]
+                        and stage_state["lines"][-1].startswith("  ↳")
+                    ):
+                        stage_state["lines"][-1] = detail
+                    else:
+                        stage_state["lines"].append(detail)
+                    stage_log.code("\n".join(stage_state["lines"]), language="text")
+                    pct = info.get("step", info.get("scanned", 0))
+                    tot = info.get("total", 1)
+                    if tot > 0 and pct > 0:
+                        status.update(
+                            label=f"{name} — {pct}/{tot} "
+                                  f"(ETA {info.get('eta_s', '?')}s)"
+                        )
+                    return
+
                 if event == "start":
                     line = f"{_icon(event)} {name} — running…"
                     if info:
@@ -451,6 +644,9 @@ def _run_pipeline(
                 else:
                     bits = ", ".join(f"{k}={v}" for k, v in info.items()) if info else ""
                     suffix = f"  ({bits})" if bits else ""
+                    # Remove any trailing progress line before writing the final state
+                    if stage_state["lines"] and stage_state["lines"][-1].startswith("  ↳"):
+                        stage_state["lines"].pop()
                     if stage_state["lines"] and stage_state["lines"][-1].startswith(
                         f"{_icon('start')} {name} —"
                     ):
@@ -474,14 +670,18 @@ def _run_pipeline(
                 use_segmentation=use_seg,
                 yolo_size=yolo_size,
                 threshold_mult=threshold_mult,
+                skip_vlm=skip_vlm,
                 vlm_autostart_service="qwen35-turboquant.service",
                 vlm_autostop=not keep_vlm_running,
                 vlm_frame_mode=vlm_frame_mode,
                 vlm_dedup_threshold=vlm_dedup_threshold,
+                dynamic_chunking=dynamic_chunking,
+                context_threshold=context_threshold,
                 audio_enabled=audio_enabled,
                 whisper_model=whisper_model,
                 whisper_gpu_device=(None if whisper_device == -1 else whisper_device),
                 on_stage=on_stage,
+                cancel_event=cancel_event,
             )
             result = pipe.run()
             status.update(label="Done", state="complete")

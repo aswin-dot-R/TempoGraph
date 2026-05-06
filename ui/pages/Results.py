@@ -170,10 +170,70 @@ def _render_run_picker() -> Optional[Path]:
     if not runs:
         st.info(f"No runs found in {RESULTS_DIR}. Process a video first on the main page.")
         return None
-    labels = [p.name for p in runs]
-    label_to_path = dict(zip(labels, runs))
-    choice = st.sidebar.selectbox("Run", labels, index=0)
-    return label_to_path[choice]
+
+    st.sidebar.markdown(
+        '<div style="font-size:13px;color:#888;margin-bottom:6px">'
+        f'📁 {len(runs)} processed videos</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Initialise selected run in session state
+    if "selected_run" not in st.session_state:
+        st.session_state.selected_run = runs[0].name
+
+    for run_path in runs:
+        name = run_path.name
+        is_selected = (name == st.session_state.selected_run)
+
+        # Read basic stats for the preview
+        try:
+            mtime = run_path.stat().st_mtime
+            from datetime import datetime
+            time_str = datetime.fromtimestamp(mtime).strftime("%b %d, %H:%M")
+        except Exception:
+            time_str = ""
+
+        # Count frames from DB (cached)
+        n_frames = ""
+        db_path = run_path / "tempograph.db"
+        if db_path.exists():
+            try:
+                import sqlite3
+                with sqlite3.connect(str(db_path)) as conn:
+                    n = conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
+                    n_frames = f"{n} frames"
+            except Exception:
+                pass
+
+        # Highlight selected run
+        bg = "#1a3a5c" if is_selected else "#1c1f24"
+        border = "1px solid #42a5f5" if is_selected else "1px solid #2a2e35"
+        indicator = "▸ " if is_selected else "  "
+
+        btn_key = f"run_{name}"
+        st.sidebar.markdown(
+            f'<div style="background:{bg};border:{border};border-radius:8px;'
+            f'padding:8px 10px;margin-bottom:4px;cursor:pointer">'
+            f'<div style="font-size:13px;font-weight:600;color:#e0e0e0">'
+            f'{indicator}{name}</div>'
+            f'<div style="font-size:11px;color:#888;margin-top:2px">'
+            f'{time_str}  ·  {n_frames}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.sidebar.button(
+            f"Select", key=btn_key,
+            use_container_width=True,
+            type="secondary" if not is_selected else "primary",
+        ):
+            st.session_state.selected_run = name
+            st.rerun()
+
+    # Resolve selected path
+    selected = next(
+        (r for r in runs if r.name == st.session_state.selected_run), runs[0]
+    )
+    return selected
 
 
 def _render_summary(run_dir: Path, analysis: Optional[dict], bundle: dict) -> None:
@@ -403,6 +463,19 @@ def _render_frame_inspector(run_dir: Path, bundle: dict,
             )
         else:
             st.write("_no detections_")
+
+        # Per-frame transcript join: show what was being said at this timestamp
+        audio_segs = bundle.get("audio_segments", [])
+        matching_speech = [
+            s for s in audio_segs
+            if s["start_ms"] <= fr["timestamp_ms"] <= s["end_ms"]
+        ]
+        if matching_speech:
+            st.markdown("**🎤 Transcript at this timestamp**")
+            for s in matching_speech:
+                st.info(f"_{s['text'].strip()}_")
+        elif audio_segs:
+            st.caption("_(no speech at this timestamp)_")
 
         st.markdown("**Active visual events at this timestamp**")
         rows = _events_to_rows((analysis or {}).get("visual_events", []))
@@ -973,6 +1046,112 @@ def _render_artifacts(run_dir: Path) -> None:
         )
 
 
+def _render_dataset_export(run_dir: Path, bundle: dict) -> None:
+    """Dataset export tab: generate COCO/JSONL and show class distribution."""
+    st.subheader("Dataset Export")
+    st.caption(
+        "Export this run's data as standard ML training formats. "
+        "Exports are saved to `<run_dir>/exports/`."
+    )
+
+    exports_dir = run_dir / "exports"
+    existing = []
+    if exports_dir.exists():
+        existing = sorted(exports_dir.iterdir())
+
+    if existing:
+        st.success(f"{len(existing)} export file(s) already exist:")
+        for f in existing:
+            st.caption(f"  `{f.name}` — {f.stat().st_size:,} bytes")
+
+    col1, col2 = st.columns(2)
+    if col1.button("Build COCO + JSONL exports", type="primary"):
+        try:
+            from src.dataset_exporter import export_all
+            with st.spinner("Exporting..."):
+                outputs = export_all(run_dir, video_name=run_dir.name)
+            st.success(f"Exported {len(outputs)} format(s)!")
+            for fmt, path in outputs.items():
+                st.caption(f"  **{fmt}**: `{path.name}` — {path.stat().st_size:,} bytes")
+        except Exception as e:
+            st.error(f"Export failed: {e}")
+
+    # Class distribution histogram from detections
+    det_by_frame = bundle["det_by_frame"]
+    all_dets = [d for dets in det_by_frame.values() for d in dets]
+    if all_dets:
+        st.subheader("Class distribution")
+        import plotly.express as px
+        class_counts: Dict[str, int] = {}
+        for d in all_dets:
+            cls = d["class_name"]
+            class_counts[cls] = class_counts.get(cls, 0) + 1
+        sorted_classes = sorted(class_counts.items(), key=lambda x: -x[1])
+        fig = px.bar(
+            x=[c[0] for c in sorted_classes],
+            y=[c[1] for c in sorted_classes],
+            labels={"x": "Class", "y": "Count"},
+            title=f"Detection class distribution ({len(all_dets):,} total)",
+        )
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Confidence distribution
+        st.subheader("Confidence distribution")
+        confs = [d["confidence"] for d in all_dets]
+        fig2 = px.histogram(
+            x=confs, nbins=50,
+            labels={"x": "Confidence", "y": "Count"},
+            title="Detection confidence histogram",
+        )
+        fig2.update_layout(height=300)
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info("No detections in this run — nothing to export.")
+
+    # Download zip of exports
+    if exports_dir.exists() and list(exports_dir.iterdir()):
+        import io, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in exports_dir.iterdir():
+                if f.is_file():
+                    zf.write(f, f.name)
+        st.download_button(
+            "⬇ Download all exports (.zip)",
+            data=buf.getvalue(),
+            file_name=f"{run_dir.name}_exports.zip",
+            mime="application/zip",
+        )
+
+
+def _render_multimodal_correlations(analysis: Optional[dict]) -> None:
+    """Show audio↔visual correlations from analysis.json."""
+    corrs = (analysis or {}).get("multimodal_correlations", [])
+    if not corrs:
+        return
+    st.subheader("Multimodal correlations (audio ↔ visual)")
+    visual_events = (analysis or {}).get("visual_events", [])
+    audio_events = (analysis or {}).get("audio_events", [])
+    rows = []
+    for mc in corrs:
+        v_idx = mc.get("visual_idx")
+        a_idx = mc.get("audio_idx")
+        v_desc = ""
+        a_desc = ""
+        if v_idx is not None and v_idx < len(visual_events):
+            v_desc = visual_events[v_idx].get("description", "")
+        if a_idx is not None and a_idx < len(audio_events):
+            a_desc = audio_events[a_idx].get("text", "")
+        rows.append({
+            "visual_event": v_desc[:80] or f"(event #{v_idx})",
+            "audio_event": a_desc[:80] or f"(event #{a_idx})",
+            "description": mc.get("description", ""),
+            "confidence": round(mc.get("confidence", 0), 2),
+        })
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
 # ─── entry ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -987,10 +1166,11 @@ def main() -> None:
     bundle = _load_run_bundle(str(run_dir))
 
     (overview, frame_tab, entity_tab, vlm_tab, captions_tab,
-     interactive_tab, video_tab, files_tab) = st.tabs(
+     interactive_tab, video_tab, dataset_tab, files_tab) = st.tabs(
         ["Overview", "Frame inspector", "Entity inspector",
          "VLM (Qwen) outputs", "Captions",
-         "Interactive timeline", "Annotated video", "Files"]
+         "Interactive timeline", "Annotated video",
+         "Dataset export", "Files"]
     )
 
     frames_for_span = bundle["frames"]
@@ -1007,6 +1187,8 @@ def main() -> None:
         st.divider()
         st.subheader("Visual events timeline")
         _render_events_timeline(analysis, video_duration_s=video_span_s)
+        st.divider()
+        _render_multimodal_correlations(analysis)
         st.divider()
         _render_frame_thumbnails(run_dir, bundle)
 
@@ -1027,6 +1209,9 @@ def main() -> None:
 
     with video_tab:
         _render_video_player(run_dir, bundle)
+
+    with dataset_tab:
+        _render_dataset_export(run_dir, bundle)
 
     with files_tab:
         _render_artifacts(run_dir)

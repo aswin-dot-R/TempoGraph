@@ -296,6 +296,337 @@ NEW_ENTITIES: <comma-separated list like 'E3=red car, E4=brown dog' or 'none'>
 
         return results
 
+    # ── dynamic context-aware chunking ─────────────────────────────
+
+    COMPACTION_PROMPT = """/no_think
+You have been watching a video and noting frame-by-frame descriptions. Below are the summaries from all segments processed so far, plus the entity registry.
+
+Segment summaries:
+{segment_summaries}
+
+Known entities:
+{entity_block}
+
+Compress all of the above into EXACTLY TWO lines:
+LINE 1: One-sentence summary of everything that has happened so far.
+LINE 2: Key entities still on screen (comma-separated IDs + brief role).
+
+Output ONLY those two lines, nothing else.
+"""
+
+    def caption_frames_dynamic(
+        self,
+        all_frame_indices: List[int],
+        db,
+        chunk_size_hint: int = 10,
+        context_threshold: float = 0.80,
+        on_chunk: Optional[Callable[[dict], None]] = None,
+    ) -> List[ChunkCaption]:
+        """Context-aware dynamic chunking with automatic compaction.
+
+        Instead of fixed chunk sizes, this method:
+        1. Estimates how many frames fit per chunk based on actual token usage
+        2. Tracks cumulative prompt+completion tokens across a "pass"
+        3. When cumulative tokens hit ``context_threshold`` of n_ctx,
+           performs a hard compaction: summarises everything into a 2-liner,
+           prunes the entity registry, and starts a new pass.
+
+        Args:
+            all_frame_indices: All frame indices to process (in order).
+            db: TempoGraphDB instance.
+            chunk_size_hint: Initial guess for frames per chunk (self-calibrates).
+            context_threshold: Fraction of n_ctx that triggers compaction.
+            on_chunk: Optional progress callback.
+
+        Returns:
+            List of ChunkCaption results (same as caption_chunks).
+        """
+        n_ctx = self.get_n_ctx() or 100096
+        budget = int(n_ctx * context_threshold)
+
+        self.logger.info(
+            f"Dynamic chunking: {len(all_frame_indices)} frames, "
+            f"n_ctx={n_ctx}, budget={budget} tokens "
+            f"({context_threshold:.0%} threshold)"
+        )
+
+        seed = "this is the start"
+        entity_registry: Dict[str, str] = {}
+        results: List[ChunkCaption] = []
+
+        # Self-calibrating estimates
+        est_tokens_per_image = 1500  # conservative initial guess
+        prompt_overhead_tokens = 600  # template text
+        completion_tokens_per_chunk = 500  # avg output length
+
+        # Pass tracking
+        pass_id = 0
+        pass_summaries: List[str] = []
+        cumulative_tokens = 0
+
+        idx = 0
+        chunk_id = 0
+        n_total_frames = len(all_frame_indices)
+
+        while idx < n_total_frames:
+            # Calculate dynamic chunk size based on current estimates
+            entity_text = self._format_entity_block(entity_registry)
+            entity_tokens_est = max(50, len(entity_text) // 3)
+            available_for_images = (
+                budget
+                - prompt_overhead_tokens
+                - entity_tokens_est
+                - completion_tokens_per_chunk
+            )
+            dynamic_chunk_size = max(
+                2, min(50, available_for_images // max(1, est_tokens_per_image))
+            )
+
+            # Build this chunk
+            chunk_frames = all_frame_indices[idx: idx + dynamic_chunk_size]
+
+            t0 = time.time()
+            usage: Dict[str, int] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+
+            try:
+                images_b64: List[str] = []
+                frame_lines: List[str] = []
+                for fidx in chunk_frames:
+                    frow = db.get_frame(fidx)
+                    if not frow:
+                        continue
+                    images_b64.append(self._encode_image(Path(frow["image_path"])))
+                    dets = db.get_detections_for_frame(fidx)
+                    det_text = self._format_detections(dets)
+                    ts = self._format_timestamp_ms(frow["timestamp_ms"])
+                    frame_lines.append(f"[frame {fidx} — t={ts}] YOLO: {det_text}")
+
+                entity_block = self._format_entity_block(entity_registry)
+                prompt = self.CHUNK_PROMPT_TEMPLATE.format(
+                    seed=seed,
+                    entity_block=entity_block,
+                    frame_block="\n".join(frame_lines),
+                )
+                payload = self._build_payload(prompt, images_b64)
+                response = requests.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                    timeout=600,
+                )
+                response.raise_for_status()
+                resp_json = response.json()
+                content = self._extract_content(resp_json)
+                usage = self._extract_usage(resp_json)
+
+                per_frame, summary = self._parse_chunk_response(
+                    content, chunk_frames
+                )
+                new_entities = self._parse_new_entities(content)
+                entity_registry.update(new_entities)
+
+                results.append(
+                    ChunkCaption(
+                        chunk_id=chunk_id,
+                        frame_indices=list(chunk_frames),
+                        per_frame_lines=per_frame,
+                        summary=summary,
+                        raw_response=content,
+                    )
+                )
+                if summary:
+                    seed = summary
+                    pass_summaries.append(summary)
+
+                # ── self-calibrate token estimates ──
+                actual_prompt = usage["prompt_tokens"]
+                actual_completion = usage["completion_tokens"]
+                actual_total = usage["total_tokens"]
+
+                if actual_prompt > 0 and len(images_b64) > 0:
+                    measured_per_image = (
+                        (actual_prompt - prompt_overhead_tokens - entity_tokens_est)
+                        / len(images_b64)
+                    )
+                    # Exponential moving average (blend old estimate with new)
+                    est_tokens_per_image = int(
+                        0.3 * est_tokens_per_image + 0.7 * max(500, measured_per_image)
+                    )
+                if actual_completion > 0:
+                    completion_tokens_per_chunk = int(
+                        0.3 * completion_tokens_per_chunk + 0.7 * actual_completion
+                    )
+
+                cumulative_tokens += actual_total
+
+                self.logger.info(
+                    f"Chunk {chunk_id} (pass {pass_id}): "
+                    f"{len(images_b64)} frames, "
+                    f"prompt={actual_prompt}, completion={actual_completion}, "
+                    f"cumulative={cumulative_tokens}/{budget} "
+                    f"({100*cumulative_tokens/budget:.0f}%), "
+                    f"est/img={est_tokens_per_image}, "
+                    f"dynamic_size={dynamic_chunk_size}"
+                )
+
+                # ── callback ──
+                if on_chunk is not None:
+                    try:
+                        on_chunk({
+                            "chunk_id": chunk_id,
+                            "chunk_index": len(results) - 1,
+                            "n_total": n_total_frames,
+                            "n_images": len(images_b64),
+                            "prompt_tokens": actual_prompt,
+                            "completion_tokens": actual_completion,
+                            "total_tokens": actual_total,
+                            "n_ctx": n_ctx,
+                            "cumulative_tokens": cumulative_tokens,
+                            "budget": budget,
+                            "pass_id": pass_id,
+                            "dynamic_chunk_size": dynamic_chunk_size,
+                            "est_tokens_per_image": est_tokens_per_image,
+                            "elapsed_s": round(time.time() - t0, 2),
+                            "ok": True,
+                        })
+                    except Exception as cb_e:
+                        self.logger.warning(f"on_chunk callback failed: {cb_e}")
+
+                # ── check if we need a hard compaction ──
+                next_chunk_est = (
+                    prompt_overhead_tokens
+                    + entity_tokens_est
+                    + dynamic_chunk_size * est_tokens_per_image
+                    + completion_tokens_per_chunk
+                )
+                if cumulative_tokens + next_chunk_est > budget:
+                    self.logger.info(
+                        f"⚡ Context compaction triggered at pass {pass_id}: "
+                        f"cumulative={cumulative_tokens}/{budget}, "
+                        f"entities={len(entity_registry)}, "
+                        f"summaries={len(pass_summaries)}"
+                    )
+                    seed, entity_registry = self._compact_pass(
+                        pass_summaries, entity_registry
+                    )
+                    pass_id += 1
+                    pass_summaries = []
+                    cumulative_tokens = 0
+
+            except Exception as e:
+                self.logger.warning(f"Chunk {chunk_id} failed: {e}")
+                results.append(
+                    ChunkCaption(
+                        chunk_id=chunk_id,
+                        frame_indices=list(chunk_frames),
+                        per_frame_lines={},
+                        summary="",
+                        raw_response="",
+                    )
+                )
+                if on_chunk is not None:
+                    try:
+                        on_chunk({
+                            "chunk_id": chunk_id,
+                            "chunk_index": len(results) - 1,
+                            "n_total": n_total_frames,
+                            "n_images": 0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                            "n_ctx": n_ctx,
+                            "cumulative_tokens": cumulative_tokens,
+                            "budget": budget,
+                            "pass_id": pass_id,
+                            "dynamic_chunk_size": dynamic_chunk_size,
+                            "est_tokens_per_image": est_tokens_per_image,
+                            "elapsed_s": round(time.time() - t0, 2),
+                            "ok": False,
+                            "error": str(e),
+                        })
+                    except Exception:
+                        pass
+
+            idx += len(chunk_frames)
+            chunk_id += 1
+
+        self.logger.info(
+            f"Dynamic chunking complete: {chunk_id} chunks across "
+            f"{pass_id + 1} pass(es), {len(results)} results"
+        )
+        return results
+
+    def _compact_pass(
+        self,
+        summaries: List[str],
+        entity_registry: Dict[str, str],
+    ) -> Tuple[str, Dict[str, str]]:
+        """Compact a pass: summarise into 2 lines, prune entity registry.
+
+        Tries to call the VLM for a smart summary. Falls back to a
+        mechanical truncation if the VLM call fails.
+
+        Returns:
+            (compact_seed, pruned_entity_registry)
+        """
+        # Build the compaction prompt
+        entity_block = self._format_entity_block(entity_registry)
+        summary_text = "\n".join(
+            f"  {i+1}. {s}" for i, s in enumerate(summaries) if s
+        )
+        prompt = self.COMPACTION_PROMPT.format(
+            segment_summaries=summary_text or "(none)",
+            entity_block=entity_block,
+        )
+
+        try:
+            payload = self._build_payload(prompt, [])  # text-only, no images
+            response = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                timeout=120,
+            )
+            response.raise_for_status()
+            content = self._extract_content(response.json()).strip()
+
+            # Take the first two lines
+            lines = [l.strip() for l in content.splitlines() if l.strip()]
+            compact_seed = " ".join(lines[:2]) if lines else summaries[-1]
+
+            self.logger.info(
+                f"VLM compaction: {len(summaries)} summaries + "
+                f"{len(entity_registry)} entities → seed ({len(compact_seed)} chars)"
+            )
+
+        except Exception as e:
+            self.logger.warning(f"VLM compaction failed ({e}), using mechanical fallback")
+            # Mechanical fallback: last 3 summaries
+            compact_seed = "; ".join(summaries[-3:])
+            if len(compact_seed) > 300:
+                compact_seed = compact_seed[-300:]
+
+        # Prune entity registry: keep only the most recent N entities
+        # (entities mentioned in recent summaries are more relevant)
+        max_entities = 20
+        if len(entity_registry) > max_entities:
+            # Keep entities that appear in recent summaries
+            recent_text = " ".join(summaries[-5:]).lower()
+            scored = []
+            for eid, desc in entity_registry.items():
+                score = 1 if eid.lower() in recent_text else 0
+                score += 1 if desc.lower()[:20] in recent_text else 0
+                scored.append((score, eid, desc))
+            scored.sort(reverse=True)
+            entity_registry = {eid: desc for _, eid, desc in scored[:max_entities]}
+            self.logger.info(
+                f"Entity pruning: kept {len(entity_registry)}/{len(scored)} entities"
+            )
+
+        return compact_seed, entity_registry
+
     @staticmethod
     def _format_detections(dets) -> str:
         if not dets:

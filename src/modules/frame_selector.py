@@ -26,6 +26,7 @@ class FrameSelector:
         camera_mode: CameraMode = CameraMode.STATIC,
         sample_fps: float = 1.0,
         threshold_mult: float = 1.0,
+        on_progress: "Optional[callable]" = None,
     ) -> FrameSelectionResult:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -46,11 +47,13 @@ class FrameSelector:
 
         if camera_mode == CameraMode.STATIC:
             scan_indices, deltas = self._scan_pixel_deltas(
-                cap, scan_interval, width, height
+                cap, scan_interval, width, height,
+                total_frames=total, on_progress=on_progress,
             )
         else:
             scan_indices, deltas = self._scan_motion_compensated_deltas(
-                cap, scan_interval, width, height
+                cap, scan_interval, width, height,
+                total_frames=total, on_progress=on_progress,
             )
 
         threshold = self._compute_threshold(deltas, threshold_mult)
@@ -78,14 +81,17 @@ class FrameSelector:
         )
 
     def _scan_pixel_deltas(
-        self, cap: cv2.VideoCapture, scan_interval: int, width: int, height: int
+        self, cap: cv2.VideoCapture, scan_interval: int, width: int, height: int,
+        total_frames: int = 0, on_progress: "Optional[callable]" = None,
     ) -> Tuple[List[int], List[float]]:
+        import time as _t
         thumb_w = min(self.thumb_width, width)
         thumb_h = max(1, int(height * thumb_w / width)) if width > 0 else 120
 
         indices: List[int] = []
         deltas: List[float] = []
         prev = None
+        t0 = _t.time()
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         i = 0
@@ -102,12 +108,26 @@ class FrameSelector:
                     deltas.append(float(np.mean(np.abs(gray - prev))))
                 indices.append(i)
                 prev = gray
+                # Progress callback every 100 scanned frames
+                if on_progress and len(indices) % 100 == 0:
+                    elapsed = _t.time() - t0
+                    fps = len(indices) / max(elapsed, 0.01)
+                    eta = (total_frames / scan_interval - len(indices)) / max(fps, 0.1)
+                    on_progress({
+                        "frame": i, "total": total_frames,
+                        "scanned": len(indices),
+                        "fps": round(fps, 1),
+                        "eta_s": round(max(0, eta), 1),
+                        "elapsed_s": round(elapsed, 1),
+                    })
             i += 1
         return indices, deltas
 
     def _scan_motion_compensated_deltas(
-        self, cap: cv2.VideoCapture, scan_interval: int, width: int, height: int
+        self, cap: cv2.VideoCapture, scan_interval: int, width: int, height: int,
+        total_frames: int = 0, on_progress: "Optional[callable]" = None,
     ) -> Tuple[List[int], List[float]]:
+        import time as _t
         thumb_w = min(self.thumb_width, width)
         thumb_h = max(1, int(height * thumb_w / width)) if width > 0 else 120
         orb = cv2.ORB_create(nfeatures=self.orb_features)
@@ -119,6 +139,7 @@ class FrameSelector:
         prev_gray = None
         prev_kp = None
         prev_des = None
+        t0 = _t.time()
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         i = 0
@@ -142,6 +163,18 @@ class FrameSelector:
                 prev_gray = gray
                 prev_kp = kp
                 prev_des = des
+                # Progress callback every 100 scanned frames
+                if on_progress and len(indices) % 100 == 0:
+                    elapsed = _t.time() - t0
+                    fps = len(indices) / max(elapsed, 0.01)
+                    eta = (total_frames / scan_interval - len(indices)) / max(fps, 0.1)
+                    on_progress({
+                        "frame": i, "total": total_frames,
+                        "scanned": len(indices),
+                        "fps": round(fps, 1),
+                        "eta_s": round(max(0, eta), 1),
+                        "elapsed_s": round(elapsed, 1),
+                    })
             i += 1
         return indices, deltas
 

@@ -1,6 +1,5 @@
 [server]
-maxUploadSize = 4096
-maxMessageSize = 4096
-
-[browser]
-gatherUsageStats = false
+# Upload limit for the browser-based uploader only.
+# For large files (> 2 GB), use the "Local file path" input instead —
+# it reads the file directly from disk with zero RAM overhead.
+maxUploadSize = 2000

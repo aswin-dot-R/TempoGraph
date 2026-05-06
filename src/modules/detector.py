@@ -177,12 +177,16 @@ class ObjectDetector:
         db,
         frame_width: int,
         frame_height: int,
+        on_progress: "Optional[callable]" = None,
     ):
         """Run detection on frames and insert normalized rows into the DB."""
         self._load_model()
-        self.logger.info(f"Detect-to-DB: {len(frame_paths)} frames")
+        total = len(frame_paths)
+        self.logger.info(f"Detect-to-DB: {total} frames")
+        det_count = 0
+        t0 = time.time()
 
-        for frame_idx, frame_path in zip(frame_indices, frame_paths):
+        for step, (frame_idx, frame_path) in enumerate(zip(frame_indices, frame_paths)):
             try:
                 frame = self._read_frame(frame_path)
                 results = self._model.track(
@@ -230,9 +234,26 @@ class ObjectDetector:
                         y2=y2 / frame_height,
                         confidence=conf,
                     )
+                    det_count += 1
             except Exception as e:
                 self.logger.warning(f"detect_to_db error frame {frame_idx}: {e}")
                 continue
+
+            # Progress callback
+            if on_progress is not None:
+                elapsed = time.time() - t0
+                fps = (step + 1) / max(elapsed, 0.01)
+                remaining = total - step - 1
+                eta = remaining / max(fps, 0.1)
+                on_progress({
+                    "frame_idx": int(frame_idx),
+                    "step": step + 1,
+                    "total": total,
+                    "detections": det_count,
+                    "fps": round(fps, 1),
+                    "eta_s": round(max(0, eta), 1),
+                    "elapsed_s": round(elapsed, 1),
+                })
 
     def _read_frame(self, frame_path: Path) -> Optional[object]:
         """Read frame using OpenCV."""

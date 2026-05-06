@@ -4,6 +4,7 @@ import gc
 import json
 import logging
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -60,12 +61,15 @@ class PipelineV2:
         vlm_autostop: bool = False,
         vlm_frame_mode: str = "scored",
         vlm_dedup_threshold: float = 0.92,
+        dynamic_chunking: bool = True,
+        context_threshold: float = 0.80,
         audio_enabled: bool = False,
         whisper_model: str = "base.en",
         whisper_binary: Optional[str] = None,
         whisper_gpu_device: Optional[int] = 1,  # Vulkan dev 1 = NVIDIA 3060 (radv on AMD has device-lost issues)
         whisper_language: Optional[str] = None,
         on_stage: Optional[Callable[[str, str, dict], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ):
         self.config = config
         self.camera_mode = camera_mode
@@ -94,15 +98,21 @@ class PipelineV2:
             )
         self.vlm_frame_mode = vlm_frame_mode
         self.vlm_dedup_threshold = vlm_dedup_threshold
+        self.dynamic_chunking = dynamic_chunking
+        self.context_threshold = context_threshold
         self.audio_enabled = audio_enabled
         self.whisper_model = whisper_model
         self.whisper_binary = whisper_binary
         self.whisper_gpu_device = whisper_gpu_device
         self.whisper_language = whisper_language
         self._on_stage = on_stage
+        self._cancel_event = cancel_event
         self.logger = logging.getLogger(__name__)
 
     def _stage(self, name: str, event: str = "start", **info) -> None:
+        # Check for cancellation between stages
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise KeyboardInterrupt(f"Pipeline cancelled before {name} ({event})")
         if self._on_stage is None:
             return
         try:
@@ -169,11 +179,16 @@ class PipelineV2:
             # Stage 1: frame selection + JPEG export
             self._stage("Frame selection", "start")
             t0 = time.time()
+
+            def _frame_scan_progress(info: dict) -> None:
+                self._stage("Frame selection", "progress", **info)
+
             selection = FrameSelector().select(
                 video_path=self.config.video_path,
                 camera_mode=self.camera_mode,
                 sample_fps=self.yolo_fps,
                 threshold_mult=self.threshold_mult,
+                on_progress=_frame_scan_progress,
             )
             frame_paths = self._extract_and_save_frames(
                 selection.frame_indices, out_dir / "frames"
@@ -248,12 +263,17 @@ class PipelineV2:
                 confidence=self.config.confidence,
                 device="cuda" if (_TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu",
             )
+
+            def _yolo_progress(info: dict) -> None:
+                self._stage("YOLO detection", "progress", **info)
+
             detector.detect_to_db(
                 frame_indices=selection.frame_indices,
                 frame_paths=frame_paths,
                 db=db,
                 frame_width=saved_w,
                 frame_height=saved_h,
+                on_progress=_yolo_progress,
             )
             detector.cleanup()
             gc.collect()
@@ -369,14 +389,12 @@ class PipelineV2:
                 )
 
             # Stage 5: chunked VLM
-            chunks: List[Tuple[int, List[int]]] = []
-            for i in range(0, len(vlm_frames), self.chunk_size):
-                chunks.append((len(chunks), vlm_frames[i : i + self.chunk_size]))
             self._stage(
                 "VLM captioning", "start",
-                chunks=len(chunks),
                 vlm_url=self.vlm_url,
                 vlm_model=self.vlm_model,
+                dynamic_chunking=self.dynamic_chunking,
+                context_threshold=self.context_threshold,
             )
             t0 = time.time()
             backend = LlamaServerBackend(base_url=self.vlm_url, model=self.vlm_model)
@@ -385,7 +403,23 @@ class PipelineV2:
             def _chunk_cb(info: dict) -> None:
                 self._stage("VLM chunk", "done", **info)
 
-            chunk_caps = backend.caption_chunks(chunks=chunks, db=db, on_chunk=_chunk_cb)
+            if self.dynamic_chunking:
+                # Dynamic context-aware chunking with auto-compaction
+                chunk_caps = backend.caption_frames_dynamic(
+                    all_frame_indices=vlm_frames,
+                    db=db,
+                    chunk_size_hint=self.chunk_size,
+                    context_threshold=self.context_threshold,
+                    on_chunk=_chunk_cb,
+                )
+            else:
+                # Legacy fixed-size chunking
+                chunks: List[Tuple[int, List[int]]] = []
+                for i in range(0, len(vlm_frames), self.chunk_size):
+                    chunks.append((len(chunks), vlm_frames[i : i + self.chunk_size]))
+                chunk_caps = backend.caption_chunks(
+                    chunks=chunks, db=db, on_chunk=_chunk_cb,
+                )
             try:
                 with open(out_dir / "chunks.json", "w") as f:
                     json.dump(
@@ -548,19 +582,57 @@ class PipelineV2:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         scale = self.frame_max_width / width if width > self.frame_max_width else 1.0
         paths: List[Path] = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        total = len(indices)
+        t0 = time.time()
+
+        self._stage(
+            "Frame export", "start",
+            frames=total,
+            scale=f"{scale:.2f}" if scale < 1.0 else "1.0",
+        )
+
+        # Use set for O(1) lookup
+        index_set = set(indices)
+        max_idx = max(indices) if indices else 0
+        saved = {}
+
+        # Sequential read is much faster than random seek for dense indices
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame_num = 0
+        while frame_num <= max_idx:
             ret, frame = cap.read()
             if not ret:
-                continue
-            if scale < 1.0:
-                new_w = int(width * scale)
-                new_h = int(frame.shape[0] * scale)
-                frame = cv2.resize(frame, (new_w, new_h))
-            p = out_dir / f"frame_{idx:06d}.jpg"
-            cv2.imwrite(str(p), frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
-            paths.append(p)
+                break
+            if frame_num in index_set:
+                if scale < 1.0:
+                    new_w = int(width * scale)
+                    new_h = int(frame.shape[0] * scale)
+                    frame = cv2.resize(frame, (new_w, new_h))
+                p = out_dir / f"frame_{frame_num:06d}.jpg"
+                cv2.imwrite(str(p), frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+                saved[frame_num] = p
+
+                step = len(saved)
+                if step % 50 == 0 or step == total:
+                    elapsed = time.time() - t0
+                    fps = step / max(elapsed, 0.01)
+                    eta = (total - step) / max(fps, 0.1)
+                    self._stage("Frame export", "progress",
+                                step=step, total=total,
+                                fps=round(fps, 1),
+                                eta_s=round(max(0, eta), 1))
+            frame_num += 1
+
         cap.release()
+
+        # Return paths in the original index order
+        paths = [saved[idx] for idx in indices if idx in saved]
+
+        self._stage(
+            "Frame export", "done",
+            elapsed_s=round(time.time() - t0, 2),
+            saved=len(paths),
+        )
         return paths
 
 
