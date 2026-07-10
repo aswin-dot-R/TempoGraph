@@ -1,749 +1,602 @@
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+"""TempoGraph v2 — 'Drop → Plan → Run → Explore' UI.
 
+Screen 1 (Landing): drop zone + path input + recent runs gallery.
+Screen 2 (Plan): derived plan sentence + ETA + Adjust expander.
+Screen 3 (Progress): stage checklist + Cancel + live counters.
+After: auto-navigate to Results page.
+"""
+
+from __future__ import annotations
+
+import json
 import os
+import sqlite3
+import sys
 import tempfile
 import threading
+from pathlib import Path
+from typing import Optional
 
-import plotly.graph_objects as go
 import streamlit as st
 
-from src.models import CameraMode, PipelineConfig
-from src.modules.frame_selector import FrameSelector
-from src.pipeline_v2 import PipelineV2
+# Ensure project root is on sys.path for src imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.auto_profile import VideoFacts, DerivedPlan, derive_plan, probe  # noqa: E402
+from src.models import CameraMode, PipelineConfig  # noqa: E402
+from src.pipeline_v2 import PipelineV2  # noqa: E402
+from src.runtime_estimator import estimate_run, format_seconds  # noqa: E402
+
+# ── state keys ───────────────────────────────────────────────────────
+KEY_VIDEO = "tg_video_path"
+KEY_NAME = "tg_video_name"
+KEY_FACTS = "tg_video_facts"
+KEY_PLAN = "tg_derived_plan"
+KEY_OVERRIDES = "tg_override_values"
+KEY_RUNNING = "tg_is_running"
+KEY_CANCEL = "tg_cancel_event"
+
+# ── legacy knob defaults ─────────────────────────────────────────────
+DEFAULT_KNOBS = {
+    "camera_mode": "auto",
+    "yolo_enabled": True,
+    "yolo_fps": 1.0,
+    "yolo_size": "n",
+    "yolo_seg": True,
+    "confidence": 0.5,
+    "depth_enabled": True,
+    "audio_enabled": True,
+    "whisper_model": "base.en",
+    "whisper_device": 1,
+    "skip_vlm": False,
+    "vlm_frame_mode": "keyframes",
+    "vlm_fps": 0.5,
+    "chunk_size": 10,
+    "vlm_dedup_threshold": 0.92,
+    "dynamic_chunking": True,
+    "context_threshold": 0.80,
+    "keep_vlm_running": False,
+    "threshold_mult": 1.0,
+}
 
 
 def main():
     st.set_page_config(page_title="TempoGraph v2", layout="wide")
-    st.title("TempoGraph v2 - Chunked VLM Pipeline")
+    st.title("TempoGraph v2")
 
-    st.sidebar.header("Pipeline Configuration")
+    # ── Determine current screen ─────────────────────────────────────
+    if KEY_RUNNING in st.session_state and st.session_state[KEY_RUNNING]:
+        _render_progress_screen()
+        return
 
-    camera_mode_label = st.sidebar.radio(
-        "Camera type",
-        options=["Static / fixed (CCTV)", "Moving / handheld", "Auto-detect"],
-        index=0,
-    )
-    camera_mode = {
-        "Static / fixed (CCTV)": CameraMode.STATIC,
-        "Moving / handheld": CameraMode.MOVING,
-        "Auto-detect": CameraMode.AUTO,
-    }[camera_mode_label]
+    if KEY_PLAN not in st.session_state or st.session_state[KEY_PLAN] is None:
+        _render_landing_screen()
+        return
 
-    st.sidebar.subheader("Object Detection (YOLO26)")
-    yolo_enabled = st.sidebar.checkbox("Enable", value=True, key="yolo_en")
-    yolo_fps = st.sidebar.slider("Sweep FPS", 0.25, 4.0, 1.0, 0.25)
-    yolo_size = st.sidebar.selectbox(
-        "Model size",
-        options=["n", "s", "m", "l", "x"],
-        index=0,
-        format_func=lambda s: {
-            "n": "n — nano (~5 MB, fastest)",
-            "s": "s — small (~22 MB)",
-            "m": "m — medium (~50 MB)",
-            "l": "l — large (~85 MB)",
-            "x": "x — xlarge (~140 MB, most accurate)",
-        }[s],
-        help="Larger = more accurate but more VRAM and slower. "
-             "On the 6 GB 3060, n/s are safe; m fits; l/x compete with "
-             "depth model — use depth=off if you go big.",
-    )
-    use_seg = st.sidebar.checkbox(
-        "Use segmentation variant",
-        value=True,
-        help="Seg variant emits the same bboxes plus instance masks "
-             "(masks aren't persisted yet — bboxes are identical between "
-             "yolo26<size>.pt and yolo26<size>-seg.pt).",
-    )
-    confidence = st.sidebar.slider("Confidence", 0.1, 0.9, 0.5, 0.05)
+    _render_plan_screen()
 
-    st.sidebar.subheader("Depth Estimation")
-    depth_enabled = st.sidebar.checkbox(
-        "Enable (spatial awareness — slower)", value=False
+
+# ── Screen 1: Landing ───────────────────────────────────────────────
+def _render_landing_screen():
+    # Zero sidebar widgets on landing
+    st.sidebar.markdown("### Welcome")
+    st.sidebar.caption("Drop a video or enter a file path to begin.")
+
+    # ── Drop zone ────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='text-align:center;padding:30px 0;'>"
+        "<p style='color:#888;font-size:16px'>Drag &amp; drop a video file below</p>"
+        "</div>",
+        unsafe_allow_html=True,
     )
 
-    st.sidebar.subheader("Audio (whisper.cpp)")
-    audio_enabled = st.sidebar.checkbox("Transcribe audio", value=True)
-    whisper_model = st.sidebar.selectbox(
-        "Whisper model",
-        options=[
-            "tiny", "tiny.en",
-            "base", "base.en",
-            "small", "small.en",
-            "medium", "medium.en",
-            "large-v1", "large-v2", "large-v3", "large-v3-turbo",
-        ],
-        index=3,  # base.en
-        disabled=not audio_enabled,
-        format_func=lambda m: {
-            "tiny": "tiny — multilingual, ~75 MB, ~32× rt",
-            "tiny.en": "tiny.en — English-only, ~75 MB, ~32× rt",
-            "base": "base — multilingual, ~141 MB, ~16× rt",
-            "base.en": "base.en — English-only, ~141 MB, ~16× rt (default)",
-            "small": "small — multilingual, ~466 MB, ~6× rt",
-            "small.en": "small.en — English-only, ~466 MB, ~6× rt",
-            "medium": "medium — multilingual, ~1.5 GB, ~2× rt",
-            "medium.en": "medium.en — English-only, ~1.5 GB, ~2× rt",
-            "large-v1": "large-v1 — multilingual, ~3 GB, ~1× rt",
-            "large-v2": "large-v2 — multilingual, ~3 GB, ~1× rt",
-            "large-v3": "large-v3 — multilingual, ~3 GB, ~1× rt (best)",
-            "large-v3-turbo": "large-v3-turbo — multilingual, ~1.6 GB, ~4× rt",
-        }[m],
-        help="Models auto-download from Hugging Face on first use "
-             "to /home/ashie/whisper.cpp/models/. Speed multipliers are "
-             "rough realtime ratios on a 3060 over Vulkan.",
-    )
-    whisper_device = st.sidebar.radio(
-        "Whisper GPU (Vulkan device)",
-        options=[1, 0, -1],
-        index=0,
-        format_func=lambda d: {1: "NVIDIA 3060 (recommended)",
-                                0: "AMD 9070 XT",
-                                -1: "CPU only"}[d],
-        disabled=not audio_enabled,
-        help="Vulkan device id. AMD radv occasionally throws device-lost "
-             "errors; default is NVIDIA.",
-    )
-
-    st.sidebar.subheader("VLM Captioning (llama-server)")
-    skip_vlm = st.sidebar.checkbox(
-        "Skip VLM captioning (preprocess only)",
-        value=False,
-        help="Check this to run only frame extraction + YOLO detection "
-             "without the VLM summarisation stage. Useful for preparing "
-             "videos for Ethogram coding or quick preview.",
-    )
-    vlm_frame_mode = st.sidebar.radio(
-        "Frame source for VLM",
-        options=["keyframes", "scored"],
-        index=0,
-        disabled=skip_vlm,
-        format_func=lambda m: {
-            "keyframes": "Keyframes only (motion-detected)",
-            "scored":    "Top-K scored at Caption FPS",
-        }[m],
-        help="keyframes: send only the motion-detected keyframes from "
-             "FrameSelector — no extra sampling. scored: pick top-K from all "
-             "sampled frames at Caption FPS using FrameScorer (detection "
-             "density + track churn + IoU change).",
-    )
-    vlm_fps = st.sidebar.slider(
-        "Caption FPS", 0.1, 2.0, 0.5, 0.1,
-        disabled=(vlm_frame_mode == "keyframes" or skip_vlm),
-        help="Ignored in keyframes-only mode.",
-    )
-    chunk_size = st.sidebar.slider("Frames per chunk", 4, 16, 10, 1, disabled=skip_vlm)
-    vlm_dedup_threshold = st.sidebar.slider(
-        "Frame dedup threshold",
-        0.0, 1.0, 0.92, 0.01,
-        help="Drop VLM frames whose similarity to the previous kept frame "
-             "exceeds this value (64×64 grayscale thumbnail diff). "
-             "Higher = more aggressive dedup. 0 = disabled. "
-             "Default 0.92 eliminates near-identical frames that produce "
-             "'(no change)' VLM responses.",
-    )
-    dynamic_chunking = st.sidebar.checkbox(
-        "Dynamic chunking (auto context management)",
-        value=True,
-        help="When enabled, chunk sizes are auto-calculated based on actual "
-             "token usage and the context window compacts automatically "
-             "when approaching the threshold. Disabling uses fixed chunk sizes.",
-    )
-    context_threshold = st.sidebar.slider(
-        "Context compaction threshold",
-        0.50, 0.95, 0.80, 0.05,
-        disabled=not dynamic_chunking,
-        help="Fraction of n_ctx that triggers a hard compaction pass. "
-             "When cumulative prompt+completion tokens across chunks exceed "
-             "this threshold × n_ctx, the system summarises everything into "
-             "a 2-line seed and prunes the entity registry.",
-    )
-    keep_vlm_running = st.sidebar.checkbox(
-        "Keep VLM running after this video",
-        value=False,
-        help="Off (default): stop qwen35-turboquant.service when the run ends "
-             "to free GPU VRAM. On: leave it loaded for back-to-back runs "
-             "(saves ~10–15s startup per subsequent run).",
-    )
-
-    st.sidebar.subheader("Frame Selection")
-    threshold_mult = st.sidebar.slider("Keyframe threshold (× σ)", 0.5, 3.0, 1.0, 0.1)
-
-    # ── Video input: local path (primary) or small upload (fallback) ──
-    import os
-    import subprocess
-
-    st.markdown("#### Video input")
-    input_mode = st.radio(
-        "Source",
-        ["Local file path (recommended for large files)", "Upload (< 2 GB)"],
-        horizontal=True,
+    uploaded = st.file_uploader(
+        "",
+        type=["mp4", "avi", "mov", "mkv", "webm", "flv"],
         label_visibility="collapsed",
+        key="landing_uploader",
     )
 
-    video_path = None
-    video_name = None
+    # ── Path / URL input ─────────────────────────────────────────────
+    path_input = st.text_input(
+        "Or enter a local file path:",
+        placeholder="/home/username/videos/clip.mp4",
+        key="path_input",
+    )
 
-    if input_mode.startswith("Local"):
-        local_path = st.text_input(
-            "Path to video file",
-            placeholder="/home/ashie/videos/camera0_4k.mkv",
-            help="Absolute path on your filesystem. "
-                 "No RAM overhead — the file is read directly by OpenCV/FFmpeg.",
-        )
-        if local_path and os.path.isfile(local_path):
-            video_name = os.path.basename(local_path)
-            ext = os.path.splitext(local_path)[1].lower()
-            # Remux non-MP4 or any file to fix broken timestamps
-            if ext != ".mp4":
-                fixed = os.path.join(
-                    tempfile.gettempdir(),
-                    os.path.splitext(video_name)[0] + "_fixed.mp4",
-                )
-                if not os.path.exists(fixed):
-                    with st.spinner(f"Remuxing {video_name} → MP4 (fast, no re-encode)..."):
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-i", local_path,
-                             "-c", "copy", "-fflags", "+genpts", fixed],
-                            capture_output=True,
-                        )
-                video_path = fixed
-            else:
-                video_path = local_path
-            st.success(f"✓ `{video_name}` — ready")
-        elif local_path:
-            st.error(f"File not found: `{local_path}`")
-    else:
-        uploaded = st.file_uploader(
-            "Upload video (< 2 GB)",
-            type=["mp4", "avi", "mov", "mkv"],
-        )
-        if uploaded is not None:
-            video_name = uploaded.name
-            ext = os.path.splitext(uploaded.name)[1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
-                f.write(uploaded.read())
-                raw_path = f.name
-            fixed = raw_path + "_fixed.mp4"
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", raw_path,
-                 "-c", "copy", "-fflags", "+genpts", fixed],
-                capture_output=True,
-            )
-            video_path = fixed
+    # ── Resolve video ────────────────────────────────────────────────
+    video_path: Optional[str] = None
+    video_name: Optional[str] = None
+
+    if uploaded is not None:
+        video_name = uploaded.name
+        ext = os.path.splitext(uploaded.name)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
+            f.write(uploaded.read())
+            video_path = f.name
+    elif path_input and os.path.isfile(path_input):
+        video_name = os.path.basename(path_input)
+        video_path = path_input
 
     if video_path is None:
+        st.session_state[KEY_PLAN] = None
+        _render_recent_runs()
         return
 
-    col1, col2 = st.columns(2)
-    if col1.button("Preview frame selection"):
-        _render_selection_preview(video_path, camera_mode, yolo_fps, threshold_mult)
+    # ── Probe + derive plan ──────────────────────────────────────────
+    try:
+        facts = probe(video_path)
+        plan = derive_plan(facts)
+        st.session_state[KEY_FACTS] = facts
+        st.session_state[KEY_PLAN] = plan
+        st.session_state[KEY_VIDEO] = video_path
+        st.session_state[KEY_NAME] = video_name
+        st.session_state[KEY_OVERRIDES] = dict(DEFAULT_KNOBS)
+        st.rerun()
+    except Exception as e:
+        st.error(f"Failed to probe video: {e}")
+        _render_recent_runs()
 
-    # Check for existing run with same name
-    import shutil
-    run_dir = Path(f"results/{video_name}")
-    if run_dir.exists() and (run_dir / "tempograph.db").exists():
-        st.warning(f"⚠ A previous run for **{video_name}** already exists.")
-        # Show basic stats
-        try:
-            import sqlite3
-            with sqlite3.connect(str(run_dir / "tempograph.db")) as _c:
-                n_frames = _c.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
-                n_dets = _c.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
-            from datetime import datetime
-            mtime = datetime.fromtimestamp(run_dir.stat().st_mtime).strftime("%b %d, %H:%M")
-            st.caption(
-                f"Previous run: {n_frames} frames, {n_dets} detections — last modified {mtime}"
-            )
-        except Exception:
-            pass
 
-        dup_col1, dup_col2, dup_col3 = st.columns(3)
-        if dup_col1.button("🗑 Delete previous & re-run", type="primary"):
-            shutil.rmtree(run_dir)
-            st.success("Previous run deleted. Click **Run full pipeline** again.")
-            st.rerun()
-        if dup_col2.button("📂 Keep both (append timestamp)"):
-            from datetime import datetime
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            video_name = f"{os.path.splitext(video_name)[0]}_{ts}{os.path.splitext(video_name)[1]}"
-            st.info(f"New run will be saved as **{video_name}**")
-        if dup_col3.button("Run full pipeline (overwrite)", type="secondary"):
-            _run_pipeline(
-                video_path=video_path,
-                video_name=video_name,
-                camera_mode=camera_mode,
-                yolo_fps=yolo_fps,
-                vlm_fps=vlm_fps,
-                chunk_size=chunk_size,
-                confidence=confidence,
-                depth_enabled=depth_enabled,
-                use_seg=use_seg,
-                yolo_size=yolo_size,
-                threshold_mult=threshold_mult,
-                keep_vlm_running=keep_vlm_running,
-                vlm_frame_mode=vlm_frame_mode,
-                vlm_dedup_threshold=vlm_dedup_threshold,
-                dynamic_chunking=dynamic_chunking,
-                context_threshold=context_threshold,
-                skip_vlm=skip_vlm,
-                audio_enabled=audio_enabled,
-                whisper_model=whisper_model,
-                whisper_device=whisper_device,
-            )
+def _render_recent_runs():
+    """Show recent runs gallery below the landing controls."""
+    results_dir = Path("results")
+    if not results_dir.exists():
         return
 
-    if col2.button("Run full pipeline", type="primary"):
-        _run_pipeline(
-            video_path=video_path,
-            video_name=video_name,
-            camera_mode=camera_mode,
-            yolo_fps=yolo_fps,
-            vlm_fps=vlm_fps,
-            chunk_size=chunk_size,
-            confidence=confidence,
-            depth_enabled=depth_enabled,
-            use_seg=use_seg,
-            yolo_size=yolo_size,
-            threshold_mult=threshold_mult,
-            keep_vlm_running=keep_vlm_running,
-            vlm_frame_mode=vlm_frame_mode,
-            vlm_dedup_threshold=vlm_dedup_threshold,
-            dynamic_chunking=dynamic_chunking,
-            context_threshold=context_threshold,
-            skip_vlm=skip_vlm,
-            audio_enabled=audio_enabled,
-            whisper_model=whisper_model,
-            whisper_device=whisper_device,
-        )
+    runs = []
+    for d in results_dir.iterdir():
+        if d.is_dir() and (d / "tempograph.db").exists():
+            try:
+                with sqlite3.connect(str(d / "tempograph.db")) as conn:
+                    n_frames = conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
+                    n_dets = conn.execute("SELECT COUNT(*) FROM detections").fetchone()[
+                        0
+                    ]
+                n_entities = 0
+                n_events = 0
+                n_captions = 0
+                analysis = d / "analysis.json"
+                if analysis.exists():
+                    data = json.loads(analysis.read_text())
+                    n_entities = len(data.get("entities", []))
+                    n_events = len(data.get("visual_events", []))
+                n_captions = 0
+                chunks = d / "chunks.json"
+                if chunks.exists():
+                    data = json.loads(chunks.read_text())
+                    n_captions = sum(1 for c in data if c.get("summary"))
+
+                from datetime import datetime
+
+                mtime = datetime.fromtimestamp(d.stat().st_mtime).strftime("%b %d")
+                runs.append(
+                    {
+                        "name": d.name,
+                        "path": str(d),
+                        "mtime": mtime,
+                        "n_frames": n_frames,
+                        "n_detections": n_dets,
+                        "n_entities": n_entities,
+                        "n_events": n_events,
+                        "n_captions": n_captions,
+                    }
+                )
+            except Exception:
+                continue
+
+    if not runs:
+        return
+
+    st.divider()
+    st.markdown("### Recent runs")
+
+    for r in runs[:8]:
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Frames", r["n_frames"])
+        col2.metric("Detections", r["n_detections"])
+        col3.metric("Entities", r["n_entities"])
+        col4.metric("Events", r["n_events"])
+        col5.caption(r["mtime"])
+        if st.button(
+            f"Open: {r['name']}", key=f"open_run_{r['name']}", use_container_width=True
+        ):
+            st.session_state["selected_run"] = r["name"]
+            st.switch_page("ui/pages/Results.py")
 
 
-def _render_selection_preview(video_path, camera_mode, sample_fps, threshold_mult):
-    selector = FrameSelector()
-    result = selector.select(
-        video_path=video_path,
-        camera_mode=camera_mode,
-        sample_fps=sample_fps,
-        threshold_mult=threshold_mult,
-    )
+# ── Screen 2: Plan ──────────────────────────────────────────────────
+def _render_plan_screen():
+    facts: VideoFacts = st.session_state[KEY_FACTS]
+    plan: DerivedPlan = st.session_state[KEY_PLAN]
+    video_path: str = st.session_state[KEY_VIDEO]
+    video_name: str = st.session_state[KEY_NAME]
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=result.scan_indices,
-            y=result.deltas,
-            mode="lines",
-            name="delta",
-            line=dict(color="lightgray"),
-        )
-    )
-    fig.add_hline(
-        y=result.threshold,
-        line_dash="dash",
-        line_color="red",
-        annotation_text=f"threshold={result.threshold:.2f}",
-    )
-
-    kf_set = set(result.keyframe_indices)
-    smp_set = set(result.sampled_indices) - kf_set
-
-    kf_x = [i for i in result.scan_indices if i in kf_set]
-    kf_y = [
-        result.deltas[result.scan_indices.index(i)] for i in kf_x
-    ]
-    fig.add_trace(
-        go.Scatter(x=kf_x, y=kf_y, mode="markers", name="keyframes (mandatory)",
-                   marker=dict(color="green", size=9))
-    )
-
-    smp_x = [i for i in result.scan_indices if i in smp_set]
-    smp_y = [result.deltas[result.scan_indices.index(i)] for i in smp_x]
-    fig.add_trace(
-        go.Scatter(x=smp_x, y=smp_y, mode="markers", name=f"sampled @ {sample_fps} Hz",
-                   marker=dict(color="orange", size=8))
-    )
-    fig.update_layout(
-        title=f"Frame selection preview ({result.camera_mode.value})",
-        xaxis_title="frame index",
-        yaxis_title="delta",
-        height=380,
-    )
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(
-        f"Total frames to process: {len(result.frame_indices)} "
-        f"({len(result.keyframe_indices)} green + {len(result.sampled_indices)} orange, "
-        f"after dedup)"
-    )
-
-
-def _run_pipeline(
-    video_path,
-    video_name,
-    camera_mode,
-    yolo_fps,
-    vlm_fps,
-    chunk_size,
-    confidence,
-    depth_enabled,
-    use_seg,
-    yolo_size,
-    threshold_mult,
-    keep_vlm_running,
-    vlm_frame_mode,
-    vlm_dedup_threshold,
-    dynamic_chunking,
-    context_threshold,
-    skip_vlm,
-    audio_enabled,
-    whisper_model,
-    whisper_device,
-):
-    config = PipelineConfig(
-        backend="llama-server",
-        modules={"behavior": True, "detection": True, "depth": depth_enabled, "audio": False},
-        fps=yolo_fps,
-        max_frames=999,
-        confidence=confidence,
-        video_path=video_path,
-        output_dir=f"results/{video_name}",
-    )
-    # Pre-compute ETA before the run starts (UI-only — pipeline doesn't see this)
-    from src.runtime_estimator import estimate_run, format_seconds
+    # Compute ETA
     try:
         est = estimate_run(
             video_path=video_path,
-            yolo_fps=yolo_fps,
-            vlm_fps=vlm_fps,
-            chunk_size=chunk_size,
-            yolo_size=yolo_size,
-            use_segmentation=use_seg,
-            depth_enabled=depth_enabled,
-            audio_enabled=audio_enabled,
-            whisper_model=whisper_model,
-            vlm_frame_mode=vlm_frame_mode,
-            vlm_autostart_cold=not keep_vlm_running,
+            yolo_fps=plan.yolo_fps,
+            vlm_fps=plan.vlm_fps,
+            chunk_size=plan.chunk_size,
+            yolo_size=plan.yolo_size,
+            use_segmentation=plan.yolo_seg,
+            depth_enabled=plan.depth_enabled,
+            audio_enabled=plan.audio_enabled,
+            whisper_model=plan.whisper_model,
+            vlm_frame_mode=plan.vlm_frame_mode,
+            vlm_autostart_cold=True,
         )
     except Exception:
         est = None
 
-    eta_placeholder = st.empty()
-    if est is not None:
-        eta_total_s = int(est.total_s)
-        eta_html = f"""
-<div style="border:1px solid #2a2e35;border-radius:6px;padding:10px;
-            background:#1c1f24;color:#e0e0e0;font-family:system-ui;font-size:14px">
-  <div style="display:flex;justify-content:space-between;gap:14px;align-items:center">
-    <div>
-      <span style="color:#888">elapsed</span>
-      <b id="elapsed" style="font-size:22px;color:#9ecbff">0:00</b>
-      &nbsp;/&nbsp;
-      <span style="color:#888">ETA</span>
-      <b style="font-size:18px">{format_seconds(eta_total_s)}</b>
-    </div>
-    <div style="flex:1;max-width:400px">
-      <div style="background:#0e1117;border-radius:4px;height:8px;overflow:hidden">
-        <div id="bar" style="background:#42a5f5;height:8px;width:0%;
-                              transition:width 0.4s linear"></div>
-      </div>
-    </div>
-    <div style="color:#888;font-size:12px">
-      <span id="pct">0%</span>
-    </div>
-  </div>
-  <details style="margin-top:8px;color:#bbb">
-    <summary style="cursor:pointer;color:#9ecbff">stage cost breakdown</summary>
-    <ul style="margin:6px 0 0 20px;padding:0;font-size:12px;line-height:1.5">
-      {''.join(f'<li><b>{s.name}</b> — {format_seconds(s.seconds)} &middot; <span style="color:#888">{s.note}</span></li>' for s in est.stages)}
-    </ul>
-  </details>
-</div>
-<script>
-  (function() {{
-    const t0 = Date.now();
-    const total = {eta_total_s};
-    const elapsedEl = document.getElementById('elapsed');
-    const barEl = document.getElementById('bar');
-    const pctEl = document.getElementById('pct');
-    function fmt(s) {{
-      s = Math.max(0, Math.floor(s));
-      const m = Math.floor(s/60), sec = s%60;
-      if (m >= 60) {{
-        const h = Math.floor(m/60), mm = m%60;
-        return h + ':' + String(mm).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
-      }}
-      return m + ':' + String(sec).padStart(2,'0');
-    }}
-    setInterval(() => {{
-      const e = (Date.now() - t0) / 1000;
-      elapsedEl.textContent = fmt(e);
-      const pct = total > 0 ? Math.min(100, (e/total)*100) : 0;
-      barEl.style.width = pct.toFixed(1) + '%';
-      pctEl.textContent = pct.toFixed(0) + '%';
-      if (pct >= 100) {{
-        barEl.style.background = '#ffa726';
-        pctEl.textContent = '> ETA';
-      }}
-    }}, 200);
-  }})();
-</script>"""
-        with eta_placeholder.container():
-            st.components.v1.html(eta_html, height=150)
+    eta_str = format_seconds(est.total_s) if est else "~?"
+    plan_sentence = (
+        f"Analyzing `{video_name}` ({facts.duration_s:.0f}s, "
+        f"{facts.width}×{facts.height}, "
+        f"{'audio' if facts.has_audio else 'silent'}) — "
+        f"YOLO{plan.yolo_size}-seg @ {plan.yolo_fps} fps, "
+        f"depth {'on' if plan.depth_enabled else 'off'}, "
+        f"audio {'on' if plan.audio_enabled else 'off'}, "
+        f"VLM keyframes @ {plan.vlm_fps} fps. "
+        f"Estimated time: {eta_str}."
+    )
 
-    # Live VLM context-window panel — appears once Stage 5 starts emitting.
-    ctx_panel = st.empty()
-    ctx_state: dict = {"chunks": [], "n_ctx": None, "max_prompt": 0, "agg": None}
+    st.info(plan_sentence)
 
-    def _render_ctx_panel() -> None:
-        if not ctx_state["chunks"] and ctx_state["agg"] is None:
-            return
-        n_ctx = ctx_state["n_ctx"] or 100096
-        rows_html = ""
-        for c in ctx_state["chunks"]:
-            pct = 100.0 * c["prompt_tokens"] / n_ctx if n_ctx else 0
-            bar_color = "#42a5f5" if pct < 60 else "#ffa726" if pct < 85 else "#ef5350"
-            rows_html += (
-                f'<div style="display:flex;gap:10px;align-items:center;'
-                f'font-size:12px;margin:2px 0">'
-                f'<span style="color:#888;width:80px">chunk {c["chunk_id"]}/{c["n_total"]-1}</span>'
-                f'<span style="color:#bbb;width:90px">{c["n_images"]} imgs</span>'
-                f'<div style="flex:1;background:#0e1117;border-radius:3px;height:6px;'
-                f'overflow:hidden">'
-                f'<div style="background:{bar_color};height:6px;'
-                f'width:{min(100,pct):.1f}%"></div></div>'
-                f'<span style="color:#ddd;width:140px;text-align:right">'
-                f'{c["prompt_tokens"]:,} / {n_ctx:,} ({pct:.1f}%)</span>'
-                f'<span style="color:#888;width:60px;text-align:right">'
-                f'{c["elapsed_s"]}s</span>'
-                f'</div>'
-            )
-        agg_html = ""
-        if ctx_state["agg"] is not None:
-            a = ctx_state["agg"]
-            pct = 100.0 * a["prompt_tokens"] / n_ctx if n_ctx else 0
-            bar_color = "#42a5f5" if pct < 60 else "#ffa726" if pct < 85 else "#ef5350"
-            agg_html = (
-                f'<div style="display:flex;gap:10px;align-items:center;'
-                f'font-size:12px;margin-top:6px;border-top:1px solid #2a2e35;padding-top:6px">'
-                f'<span style="color:#888;width:80px">aggregator</span>'
-                f'<span style="color:#bbb;width:90px">text-only</span>'
-                f'<div style="flex:1;background:#0e1117;border-radius:3px;height:6px;'
-                f'overflow:hidden">'
-                f'<div style="background:{bar_color};height:6px;'
-                f'width:{min(100,pct):.1f}%"></div></div>'
-                f'<span style="color:#ddd;width:140px;text-align:right">'
-                f'{a["prompt_tokens"]:,} / {n_ctx:,} ({pct:.1f}%)</span>'
-                f'<span style="color:#888;width:60px;text-align:right"></span>'
-                f'</div>'
-            )
-        max_pct = 100.0 * ctx_state["max_prompt"] / n_ctx if n_ctx else 0
-        max_color = "#42a5f5" if max_pct < 60 else "#ffa726" if max_pct < 85 else "#ef5350"
-        ctx_panel.markdown(
-            f'<div style="border:1px solid #2a2e35;border-radius:6px;padding:10px;'
-            f'background:#1c1f24;color:#e0e0e0;font-family:system-ui">'
-            f'<div style="display:flex;justify-content:space-between;'
-            f'align-items:baseline;margin-bottom:6px">'
-            f'<b style="font-size:13px">VLM context window usage (live)</b>'
-            f'<span style="font-size:12px;color:{max_color}">'
-            f'peak: {ctx_state["max_prompt"]:,} / {n_ctx:,} ({max_pct:.1f}%)</span>'
-            f'</div>'
-            f'{rows_html}{agg_html}'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+    col1, col2 = st.columns([1, 3])
+    if col1.button(
+        "Analyze", type="primary", use_container_width=True, key="analyze_btn"
+    ):
+        st.session_state[KEY_RUNNING] = True
+        st.session_state[KEY_CANCEL] = threading.Event()
+        st.rerun()
 
-    cancel_event = threading.Event()
-    cancel_holder = st.empty()
-    if cancel_holder.button("❌ Cancel pipeline", disabled=False, key="cancel_btn"):
+    # ── Adjust plan expander ─────────────────────────────────────────
+    with st.expander("Adjust plan", expanded=False):
+        _render_knobs(plan)
+
+    # Show recent runs
+    _render_recent_runs()
+
+
+def _render_knobs(plan: DerivedPlan):
+    """Render the legacy knobs, pre-filled from the derived plan."""
+    overrides = st.session_state.get(KEY_OVERRIDES, dict(DEFAULT_KNOBS))
+
+    # Camera mode
+    camera_opts = ["auto", "static", "moving"]
+    overrides["camera_mode"] = st.sidebar.selectbox(
+        "Camera mode",
+        camera_opts,
+        index=camera_opts.index(overrides.get("camera_mode", "auto")),
+        key="knob_camera_mode",
+    )
+
+    # YOLO section
+    st.sidebar.subheader("Object Detection (YOLO26)")
+    overrides["yolo_enabled"] = st.sidebar.checkbox(
+        "Enable", value=overrides.get("yolo_enabled", True), key="knob_yolo_en"
+    )
+    overrides["yolo_fps"] = st.sidebar.slider(
+        "Sweep FPS",
+        0.25,
+        4.0,
+        overrides.get("yolo_fps", 1.0),
+        0.25,
+        key="knob_yolo_fps",
+    )
+    yolo_sizes = ["n", "s", "m", "l", "x"]
+    overrides["yolo_size"] = st.sidebar.selectbox(
+        "Model size",
+        yolo_sizes,
+        index=yolo_sizes.index(overrides.get("yolo_size", "n")),
+        key="knob_yolo_size",
+    )
+    overrides["yolo_seg"] = st.sidebar.checkbox(
+        "Segmentation variant",
+        value=overrides.get("yolo_seg", True),
+        key="knob_yolo_seg",
+    )
+    overrides["confidence"] = st.sidebar.slider(
+        "Confidence", 0.1, 0.9, overrides.get("confidence", 0.5), 0.05, key="knob_conf"
+    )
+
+    # Depth
+    st.sidebar.subheader("Depth Estimation")
+    overrides["depth_enabled"] = st.sidebar.checkbox(
+        "Enable", value=overrides.get("depth_enabled", True), key="knob_depth"
+    )
+
+    # Audio
+    st.sidebar.subheader("Audio (whisper.cpp)")
+    overrides["audio_enabled"] = st.sidebar.checkbox(
+        "Transcribe audio", value=overrides.get("audio_enabled", True), key="knob_audio"
+    )
+    whisper_models = [
+        "tiny",
+        "tiny.en",
+        "base",
+        "base.en",
+        "small",
+        "small.en",
+        "medium",
+        "medium.en",
+        "large-v1",
+        "large-v2",
+        "large-v3",
+        "large-v3-turbo",
+    ]
+    overrides["whisper_model"] = st.sidebar.selectbox(
+        "Whisper model",
+        whisper_models,
+        index=whisper_models.index(overrides.get("whisper_model", "base.en")),
+        key="knob_whisper_model",
+        disabled=not overrides["audio_enabled"],
+    )
+    overrides["whisper_device"] = st.sidebar.radio(
+        "GPU device",
+        [1, 0, -1],
+        index=[1, 0, -1].index(overrides.get("whisper_device", 1)),
+        format_func=lambda d: {1: "NVIDIA", 0: "AMD", -1: "CPU"}[d],
+        key="knob_whisper_dev",
+        disabled=not overrides["audio_enabled"],
+    )
+
+    # VLM
+    st.sidebar.subheader("VLM Captioning")
+    overrides["skip_vlm"] = st.sidebar.checkbox(
+        "Skip VLM (preprocess only)",
+        value=overrides.get("skip_vlm", False),
+        key="knob_skip_vlm",
+    )
+    overrides["vlm_frame_mode"] = st.sidebar.radio(
+        "Frame source",
+        ["keyframes", "scored"],
+        index=["keyframes", "scored"].index(
+            overrides.get("vlm_frame_mode", "keyframes")
+        ),
+        key="knob_vlm_mode",
+        disabled=overrides["skip_vlm"],
+    )
+    overrides["vlm_fps"] = st.sidebar.slider(
+        "Caption FPS",
+        0.1,
+        2.0,
+        overrides.get("vlm_fps", 0.5),
+        0.1,
+        key="knob_vlm_fps",
+        disabled=overrides["vlm_frame_mode"] == "keyframes" or overrides["skip_vlm"],
+    )
+    overrides["chunk_size"] = st.sidebar.slider(
+        "Frames per chunk",
+        4,
+        16,
+        overrides.get("chunk_size", 10),
+        1,
+        key="knob_chunk",
+        disabled=overrides["skip_vlm"],
+    )
+    overrides["vlm_dedup_threshold"] = st.sidebar.slider(
+        "Dedup threshold",
+        0.0,
+        1.0,
+        overrides.get("vlm_dedup_threshold", 0.92),
+        0.01,
+        key="knob_dedup",
+    )
+    overrides["dynamic_chunking"] = st.sidebar.checkbox(
+        "Dynamic chunking",
+        value=overrides.get("dynamic_chunking", True),
+        key="knob_dynamic_chunk",
+    )
+    overrides["context_threshold"] = st.sidebar.slider(
+        "Context threshold",
+        0.50,
+        0.95,
+        overrides.get("context_threshold", 0.80),
+        0.05,
+        key="knob_ctx_thresh",
+        disabled=not overrides["dynamic_chunking"],
+    )
+    overrides["keep_vlm_running"] = st.sidebar.checkbox(
+        "Keep VLM running",
+        value=overrides.get("keep_vlm_running", False),
+        key="knob_keep_vlm",
+    )
+
+    # Frame selection
+    st.sidebar.subheader("Frame Selection")
+    overrides["threshold_mult"] = st.sidebar.slider(
+        "Keyframe threshold (× σ)",
+        0.5,
+        3.0,
+        overrides.get("threshold_mult", 1.0),
+        0.1,
+        key="knob_thresh",
+    )
+
+
+# ── Screen 3: Progress ──────────────────────────────────────────────
+def _render_progress_screen():
+    video_path = st.session_state[KEY_VIDEO]
+    video_name = st.session_state[KEY_NAME]
+    overrides = st.session_state.get(KEY_OVERRIDES, dict(DEFAULT_KNOBS))
+    cancel_event = st.session_state.get(KEY_CANCEL, threading.Event())
+
+    if cancel_event.is_set():
+        st.session_state[KEY_RUNNING] = False
+        st.session_state[KEY_PLAN] = None
+        st.warning("Pipeline cancelled.")
+        st.rerun()
+
+    st.set_page_config(page_title=f"Running: {video_name}", layout="wide")
+    st.title(f"Analyzing: {video_name}")
+
+    # Cancel button
+    if st.button("Cancel", type="secondary"):
         cancel_event.set()
+        st.rerun()
 
-    with st.status("Running v2 pipeline...", expanded=True) as status:
+    # Build pipeline kwargs
+    out_dir = f"results/{video_name}"
+    config = PipelineConfig(
+        backend="llama-server",
+        modules={
+            "behavior": True,
+            "detection": True,
+            "depth": overrides["depth_enabled"],
+            "audio": overrides["audio_enabled"],
+        },
+        fps=overrides["yolo_fps"],
+        max_frames=999,
+        confidence=overrides["confidence"],
+        video_path=video_path,
+        output_dir=out_dir,
+    )
+
+    stage_state: dict = {
+        "lines": [],
+        "counts": {"entities": 0, "detections": 0, "captions": 0},
+    }
+    stage_status = {
+        "Frame selection": "queued",
+        "Audio transcription": "queued",
+        "YOLO detection": "queued",
+        "Depth estimation": "queued",
+        "Frame scoring": "queued",
+        "VLM captioning": "queued",
+        "Aggregation": "queued",
+    }
+
+    with st.spinner("Running pipeline..."):
         try:
-            stage_log = st.empty()
-            stage_state: dict = {"lines": []}
-
-            def _icon(event: str) -> str:
-                return {
-                    "start": "▶",
-                    "done": "✓",
-                    "skipped": "·",
-                    "error": "✗",
-                }.get(event, "•")
-
-            def on_stage(name: str, event: str, info: dict) -> None:
-                # Per-chunk VLM events update the context-window panel only —
-                # they'd flood the stage log otherwise.
-                if name == "VLM chunk" and event == "done":
-                    if info.get("n_ctx"):
-                        ctx_state["n_ctx"] = info["n_ctx"]
-                    ctx_state["chunks"].append(info)
-                    ctx_state["max_prompt"] = max(
-                        ctx_state["max_prompt"], info.get("prompt_tokens", 0)
-                    )
-                    _render_ctx_panel()
-                    return
-                if name == "Aggregator call" and event == "done":
-                    ctx_state["agg"] = info
-                    ctx_state["max_prompt"] = max(
-                        ctx_state["max_prompt"], info.get("prompt_tokens", 0)
-                    )
-                    _render_ctx_panel()
-                    return
-
-                # Progress events: update in-place (don't flood the log)
-                if event == "progress":
-                    progress_prefix = f"  ↳ {name}:"
-                    if name == "Frame selection":
-                        detail = (
-                            f"  ↳ Scanning: frame {info.get('frame', '?')}/{info.get('total', '?')}"
-                            f" — {info.get('scanned', 0)} sampled"
-                            f" @ {info.get('fps', 0)} fps"
-                            f" — ETA {info.get('eta_s', 0)}s"
-                        )
-                    elif name == "Frame export":
-                        detail = (
-                            f"  ↳ Saving JPEGs: {info.get('step', 0)}/{info.get('total', 0)}"
-                            f" @ {info.get('fps', 0)} fps"
-                            f" — ETA {info.get('eta_s', 0)}s"
-                        )
-                    elif name == "YOLO detection":
-                        detail = (
-                            f"  ↳ YOLO: {info.get('step', 0)}/{info.get('total', 0)} frames"
-                            f" — {info.get('detections', 0)} detections"
-                            f" @ {info.get('fps', 0)} fps"
-                            f" — ETA {info.get('eta_s', 0)}s"
-                        )
-                    else:
-                        bits = ", ".join(f"{k}={v}" for k, v in info.items())
-                        detail = f"  ↳ {name}: {bits}"
-
-                    # Replace last progress line if exists, else append
-                    if (
-                        stage_state["lines"]
-                        and stage_state["lines"][-1].startswith("  ↳")
-                    ):
-                        stage_state["lines"][-1] = detail
-                    else:
-                        stage_state["lines"].append(detail)
-                    stage_log.code("\n".join(stage_state["lines"]), language="text")
-                    pct = info.get("step", info.get("scanned", 0))
-                    tot = info.get("total", 1)
-                    if tot > 0 and pct > 0:
-                        status.update(
-                            label=f"{name} — {pct}/{tot} "
-                                  f"(ETA {info.get('eta_s', '?')}s)"
-                        )
-                    return
-
-                if event == "start":
-                    line = f"{_icon(event)} {name} — running…"
-                    if info:
-                        bits = ", ".join(f"{k}={v}" for k, v in info.items())
-                        line += f"  ({bits})"
-                    stage_state["lines"].append(line)
-                else:
-                    bits = ", ".join(f"{k}={v}" for k, v in info.items()) if info else ""
-                    suffix = f"  ({bits})" if bits else ""
-                    # Remove any trailing progress line before writing the final state
-                    if stage_state["lines"] and stage_state["lines"][-1].startswith("  ↳"):
-                        stage_state["lines"].pop()
-                    if stage_state["lines"] and stage_state["lines"][-1].startswith(
-                        f"{_icon('start')} {name} —"
-                    ):
-                        stage_state["lines"][-1] = (
-                            f"{_icon(event)} {name} — {event}{suffix}"
-                        )
-                    else:
-                        stage_state["lines"].append(
-                            f"{_icon(event)} {name} — {event}{suffix}"
-                        )
-                status.update(label=f"{name} ({event})")
-                stage_log.code("\n".join(stage_state["lines"]), language="text")
+            camera_map = {
+                "auto": CameraMode.AUTO,
+                "static": CameraMode.STATIC,
+                "moving": CameraMode.MOVING,
+            }
+            cam_mode = camera_map.get(overrides["camera_mode"], CameraMode.AUTO)
 
             pipe = PipelineV2(
                 config,
-                camera_mode=camera_mode,
-                yolo_fps=yolo_fps,
-                vlm_fps=vlm_fps,
-                chunk_size=chunk_size,
-                depth_enabled=depth_enabled,
-                use_segmentation=use_seg,
-                yolo_size=yolo_size,
-                threshold_mult=threshold_mult,
-                skip_vlm=skip_vlm,
+                camera_mode=cam_mode,
+                yolo_fps=overrides["yolo_fps"],
+                vlm_fps=overrides["vlm_fps"],
+                chunk_size=overrides["chunk_size"],
+                depth_enabled=overrides["depth_enabled"],
+                use_segmentation=overrides["yolo_seg"],
+                yolo_size=overrides["yolo_size"],
+                threshold_mult=overrides["threshold_mult"],
+                skip_vlm=overrides["skip_vlm"],
                 vlm_autostart_service="qwen35-turboquant.service",
-                vlm_autostop=not keep_vlm_running,
-                vlm_frame_mode=vlm_frame_mode,
-                vlm_dedup_threshold=vlm_dedup_threshold,
-                dynamic_chunking=dynamic_chunking,
-                context_threshold=context_threshold,
-                audio_enabled=audio_enabled,
-                whisper_model=whisper_model,
-                whisper_gpu_device=(None if whisper_device == -1 else whisper_device),
-                on_stage=on_stage,
+                vlm_autostop=not overrides["keep_vlm_running"],
+                vlm_frame_mode=overrides["vlm_frame_mode"],
+                vlm_dedup_threshold=overrides["vlm_dedup_threshold"],
+                dynamic_chunking=overrides["dynamic_chunking"],
+                context_threshold=overrides["context_threshold"],
+                audio_enabled=overrides["audio_enabled"],
+                whisper_model=overrides["whisper_model"],
+                whisper_gpu_device=(
+                    None
+                    if overrides["whisper_device"] == -1
+                    else overrides["whisper_device"]
+                ),
                 cancel_event=cancel_event,
+                on_stage=lambda name, event, info: _on_stage_progress(
+                    name, event, info, stage_status, stage_state
+                ),
             )
             result = pipe.run()
-            status.update(label="Done", state="complete")
-            actual_s = result.processing_time
-            # Replace the live ticker with a static "done" panel so the JS
-            # setInterval inside the iframe stops.
-            if est is not None:
-                pct_of_eta = 100 * actual_s / max(1.0, est.total_s)
-                delta_s = actual_s - est.total_s
-                sign = "+" if delta_s >= 0 else "−"
-                done_color = "#66bb6a" if pct_of_eta <= 120 else "#ffa726"
-                eta_placeholder.markdown(
-                    f'<div style="border:1px solid #2a2e35;border-radius:6px;'
-                    f'padding:10px;background:#1c1f24;color:#e0e0e0;'
-                    f'font-family:system-ui;font-size:14px">'
-                    f'<span style="color:{done_color}">✓ Done</span> &mdash; '
-                    f'<b style="font-size:18px;color:#9ecbff">{format_seconds(actual_s)}</b>'
-                    f'  (ETA was {format_seconds(est.total_s)}, '
-                    f'{sign}{format_seconds(abs(delta_s))} = '
-                    f'{pct_of_eta:.0f}% of ETA)'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-                st.success(
-                    f"Done in {format_seconds(actual_s)} "
-                    f"(ETA was {format_seconds(est.total_s)}, "
-                    f"{sign}{format_seconds(abs(delta_s))} = {pct_of_eta:.0f}% of ETA)"
-                )
-            else:
-                eta_placeholder.markdown(
-                    f'<div style="border:1px solid #2a2e35;border-radius:6px;'
-                    f'padding:10px;background:#1c1f24;color:#66bb6a;'
-                    f'font-family:system-ui">✓ Done in {format_seconds(actual_s)}</div>',
-                    unsafe_allow_html=True,
-                )
-                st.success(f"Done in {actual_s:.1f}s")
+
+            # Update final counts
+            try:
+                import sqlite3
+
+                db_path = Path(out_dir) / "tempograph.db"
+                with sqlite3.connect(str(db_path)) as conn:
+                    stage_state["counts"]["detections"] = conn.execute(
+                        "SELECT COUNT(*) FROM detections"
+                    ).fetchone()[0]
+            except Exception:
+                pass
             if result.analysis:
-                st.subheader("Summary")
-                st.write(result.analysis.summary or "(empty)")
-                st.subheader("Entities")
-                st.dataframe([
-                    {"id": e.id, "type": e.type, "description": e.description}
-                    for e in result.analysis.entities
-                ])
-                st.subheader("Visual events")
-                st.dataframe([
-                    {"type": e.type.value if hasattr(e.type, "value") else str(e.type),
-                     "entities": ", ".join(e.entities), "start": e.start_time,
-                     "end": e.end_time, "description": e.description}
-                    for e in result.analysis.visual_events
-                ])
+                stage_state["counts"]["entities"] = len(result.analysis.entities)
+                stage_state["counts"]["captions"] = len(result.analysis.visual_events)
+
+            # Mark all done
+            for s in stage_status:
+                stage_status[s] = "done"
+
+            st.success(f"Done in {result.processing_time:.1f}s")
+
+            # Navigate to results
+            st.session_state[KEY_RUNNING] = False
+            st.session_state[KEY_PLAN] = None
+            st.session_state["selected_run"] = video_name
+            st.info("Analysis complete. Opening results...")
+            st.switch_page("ui/pages/Results.py")
+
+        except KeyboardInterrupt:
+            st.warning("Pipeline cancelled.")
+            st.session_state[KEY_RUNNING] = False
+            st.session_state[KEY_PLAN] = None
         except Exception as e:
-            status.update(label=f"Failed: {e}", state="error")
-            eta_placeholder.markdown(
-                f'<div style="border:1px solid #ef5350;border-radius:6px;'
-                f'padding:10px;background:#1c1f24;color:#ef5350;'
-                f'font-family:system-ui">✗ Pipeline failed: '
-                f'{str(e)[:200]}</div>',
-                unsafe_allow_html=True,
-            )
-            import traceback
-            st.code(traceback.format_exc())
+            stage_status["error"] = "done"
+            st.error(f"Pipeline failed: {e}")
+            st.session_state[KEY_RUNNING] = False
+
+    # Stage checklist
+    st.divider()
+    st.subheader("Stage status")
+    for stage, status in stage_status.items():
+        icon = {"queued": "⬜", "running": "🔄", "done": "✅", "error": "❌"}.get(
+            status, "•"
+        )
+        st.markdown(f"{icon} **{stage}** — {status}")
+
+    # Live counters
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Entities detected", stage_state["counts"]["entities"])
+    c2.metric("Detections", stage_state["counts"]["detections"])
+    c3.metric("Captions", stage_state["counts"]["captions"])
+
+    # Stage log
+    if stage_state["lines"]:
+        st.code("\n".join(stage_state["lines"]), language="text")
+
+
+def _on_stage_progress(
+    name: str, event: str, info: dict, stage_status: dict, stage_state: dict
+) -> None:
+    """Callback for pipeline stage events — renders the progress screen."""
+    if name == "VLM chunk" and event == "done":
+        return  # handled separately to avoid flooding
+
+    if name == "Aggregator call" and event == "done":
+        return
+
+    # Update stage status
+    if event == "start":
+        stage_status[name] = "running"
+    elif event == "done":
+        stage_status[name] = "done"
+        # Update counts
+        if name == "YOLO detection" and "detections" in info:
+            stage_state["counts"]["detections"] = info["detections"]
+        if name == "Frame selection" and "frames" in info:
+            stage_state["counts"]["frames"] = info["frames"]
+    elif event == "skipped":
+        stage_status[name] = "done"
+    elif event == "error":
+        stage_status[name] = "error"
+
+    # Build log line
+    icon = {"start": "▶", "done": "✓", "skipped": "·", "error": "✗"}.get(event, "•")
+    bits = ", ".join(f"{k}={v}" for k, v in info.items()) if info else ""
+    suffix = f"  ({bits})" if bits else ""
+    line = f"{icon} {name} — {event}{suffix}"
+    stage_state["lines"].append(line)
 
 
 if __name__ == "__main__":

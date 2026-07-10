@@ -38,6 +38,7 @@ def test_pipeline_v2_runs_end_to_end_with_mocked_models(tmp_path):
         MockDet.return_value.detect_to_db = MagicMock()
         MockDet.return_value.cleanup = MagicMock()
         MockLLM.return_value.caption_chunks = MagicMock(return_value=[])
+        MockLLM.return_value.caption_frames_dynamic = MagicMock(return_value=[])
         MockAgg.return_value.aggregate = MagicMock(
             return_value=AnalysisResult(summary="ok")
         )
@@ -56,5 +57,6 @@ def test_pipeline_v2_runs_end_to_end_with_mocked_models(tmp_path):
     assert result.analysis.summary == "ok"
     assert (out / "tempograph.db").exists()
     MockDet.return_value.detect_to_db.assert_called_once()
-    MockLLM.return_value.caption_chunks.assert_called_once()
+    # dynamic_chunking=True by default, so caption_frames_dynamic is called
+    MockLLM.return_value.caption_frames_dynamic.assert_called_once()
     MockAgg.return_value.aggregate.assert_called_once()

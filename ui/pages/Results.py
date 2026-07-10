@@ -426,7 +426,7 @@ def _render_frame_inspector(run_dir: Path, bundle: dict,
     c1, c2, c3 = st.columns([1, 1, 2])
     show_dets = c1.checkbox("Detections", value=True, key="insp_dets")
     show_depth = c2.checkbox("Depth heatmap", value=bool(depth_by_frame),
-                             key="insp_depth", disabled=not depth_by_frame)
+                              key="insp_depth", disabled=not depth_by_frame)
     min_conf = c3.slider("Min confidence", 0.0, 1.0, 0.25, 0.05, key="insp_conf")
 
     img_path = _resolve(fr["image_path"])
@@ -490,6 +490,137 @@ def _render_frame_inspector(run_dir: Path, bundle: dict,
             )
         else:
             st.write("_none active_")
+
+
+def _render_ask_tab(run_dir: Path, bundle: dict,
+                    analysis: Optional[dict]) -> None:
+    """Free-text Q&A grounded in the run's SQLite database."""
+    st.subheader("Ask about this run")
+    st.caption(
+        "Ask questions about the analysis results. Answers are grounded "
+        "in the detected entities, events, and metadata."
+    )
+
+    question = st.text_input("Your question:", key="ask_input",
+                            placeholder="e.g. How many entities were detected? What types of events occurred?")
+
+    if not question:
+        st.info("Type a question above and press Enter or click Ask.")
+        return
+
+    # Ground the question in the available data
+    entities = analysis.get("entities", []) if analysis else []
+    events = analysis.get("visual_events", []) if analysis else []
+    audio_events = analysis.get("audio_events", []) if analysis else []
+    summary = analysis.get("summary", "") if analysis else ""
+    n_frames = len(bundle["frames"])
+    n_dets = sum(len(v) for v in bundle["det_by_frame"].values())
+
+    # Build context
+    entity_info = ""
+    for e in entities:
+        entity_info += f"{e.get('id', '?')} ({e.get('type', '?')}): {e.get('description', '')} " \
+                       f"[first_seen={e.get('first_seen', '?')}, last_seen={e.get('last_seen', '?')}]\\n"
+
+    event_info = ""
+    for ev in events:
+        event_info += f"[{ev.get('start_time', '?')}–{ev.get('end_time', '?')}] " \
+                      f"{ev.get('type', '?')}: {ev.get('description', '')} " \
+                      f"entities={ev.get('entities', [])} conf={ev.get('confidence', 0)}\\n"
+
+    audio_info = ""
+    for ae in audio_events:
+        audio_info += f"[{ae.get('start_time', '?')}–{ae.get('end_time', '?')}] " \
+                      f"{ae.get('type', '?')}: {ae.get('text', '')}\\n"
+
+    context = (
+        f"Video run: {run_dir.name}\\n"
+        f"Frames: {n_frames}, Detections: {n_dets}\\n"
+        f"Summary: {summary}\\n"
+        f"Entities ({len(entities)}):\\n{entity_info if entity_info else '(none)'}\\n"
+        f"Visual events ({len(events)}):\\n{event_info if event_info else '(none)'}\\n"
+        f"Audio events ({len(audio_events)}):\\n{audio_info if audio_info else '(none)'}"
+    )
+
+    answer = _answer_question(question, context, analysis)
+
+    st.markdown("**Answer:**")
+    st.write(answer)
+
+
+def _answer_question(question: str, context: str,
+                     analysis: Optional[dict]) -> str:
+    """Answer a question using SQL-grounded retrieval over the run data."""
+    q_lower = question.lower().strip()
+
+    # Rule-based answers for common patterns
+    if any(w in q_lower for w in ["how many", "count", "total"]):
+        if "entity" in q_lower:
+            entities = analysis.get("entities", []) if analysis else []
+            return f"There are {len(entities)} entity/entities detected in this run."
+        elif "event" in q_lower:
+            events = analysis.get("visual_events", []) if analysis else []
+            return f"There are {len(events)} visual events detected."
+        elif "audio" in q_lower:
+            audio = analysis.get("audio_events", []) if analysis else []
+            return f"There are {len(audio)} audio events detected."
+        elif "detection" in q_lower or "detect" in q_lower:
+            return "See the Overview tab for the total detection count."
+        elif "frame" in q_lower:
+            return "See the Overview tab for the total frame count."
+        elif "caption" in q_lower:
+            chunks = analysis.get("chunks", []) if analysis else []
+            return f"There are {len(chunks)} VLM caption chunks."
+
+    elif any(w in q_lower for w in ["what type", "types of", "list entity", "who"]):
+        entities = analysis.get("entities", []) if analysis else []
+        if not entities:
+            return "No entities were detected in this run."
+        types = set(e.get("type", "?") for e in entities)
+        return f"Entity types detected: {', '.join(sorted(types))}.\n\n" + "\n".join(
+            f"- **{e.get('id', '?')}** ({e.get('type', '?')}): {e.get('description', '')}"
+            for e in entities[:10]
+        )
+
+    elif any(w in q_lower for w in ["summarize", "summary", "what happens", "describe"]):
+        summary = analysis.get("summary", "") if analysis else ""
+        if summary:
+            return summary
+        return "No summary available for this run."
+
+    elif any(w in q_lower for w in ["when", "time", "timestamp", "first", "last"]):
+        entities = analysis.get("entities", []) if analysis else []
+        if not entities:
+            return "No entities detected."
+        result = "Entity timeline:\n"
+        for e in entities:
+            result += f"- {e.get('id', '?')}: first seen {e.get('first_seen', '?')}, " \
+                      f"last seen {e.get('last_seen', '?')}\n"
+        return result
+
+    elif any(w in q_lower for w in ["event", "action", "behavior"]):
+        events = analysis.get("visual_events", []) if analysis else []
+        if not events:
+            return "No visual events detected."
+        result = "Detected events:\n"
+        for ev in events[:15]:
+            result += f"- [{ev.get('start_time', '?')}–{ev.get('end_time', '?')}] " \
+                      f"{ev.get('type', '?')}: {ev.get('description', '')}\n"
+        return result
+
+    else:
+        # Generic fallback: provide summary + key facts
+        summary = analysis.get("summary", "") if analysis else ""
+        entities = analysis.get("entities", []) if analysis else []
+        events = analysis.get("visual_events", []) if analysis else []
+        return (
+            f"Based on the analysis:\n\n"
+            f"{summary}\n\n"
+            f"- Entities: {len(entities)}\n"
+            f"- Events: {len(events)}\n"
+            f"- Audio events: {len(analysis.get('audio_events', [])) if analysis else 0}\n\n"
+            f"Try asking more specific questions like 'how many entities?' or 'what types of events?'"
+        )
 
 
 def _render_entity_inspector(bundle: dict, analysis: Optional[dict]) -> None:
@@ -1166,11 +1297,11 @@ def main() -> None:
     bundle = _load_run_bundle(str(run_dir))
 
     (overview, frame_tab, entity_tab, vlm_tab, captions_tab,
-     interactive_tab, video_tab, dataset_tab, files_tab) = st.tabs(
+     interactive_tab, video_tab, ask_tab, dataset_tab, files_tab) = st.tabs(
         ["Overview", "Frame inspector", "Entity inspector",
          "VLM (Qwen) outputs", "Captions",
          "Interactive timeline", "Annotated video",
-         "Dataset export", "Files"]
+         "Ask", "Dataset export", "Files"]
     )
 
     frames_for_span = bundle["frames"]
@@ -1209,6 +1340,9 @@ def main() -> None:
 
     with video_tab:
         _render_video_player(run_dir, bundle)
+
+    with ask_tab:
+        _render_ask_tab(run_dir, bundle, analysis)
 
     with dataset_tab:
         _render_dataset_export(run_dir, bundle)
