@@ -7,6 +7,7 @@ import html as html_lib
 import json
 import sqlite3
 import sys
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -93,6 +94,118 @@ def _ts_to_seconds(ts: str) -> float:
 def _resolve(path_str: str) -> Path:
     p = Path(path_str)
     return p if p.is_absolute() else REPO_ROOT / p
+
+
+# ── summarizer helpers ──────────────────────────────────────────────────
+
+DEFAULT_VLM_URL = "http://127.0.0.1:8082"
+
+
+def _llm_health_probe(url: str = DEFAULT_VLM_URL, timeout: float = 2.0) -> bool:
+    """Lightweight HTTP health probe of llama-server. Returns True if reachable."""
+    try:
+        req = urllib.request.Request(f"{url}/v1/models")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _get_cached_summary(run_dir: Path, db: sqlite3.Connection) -> Optional[str]:
+    """Read a cached summary from run_meta, or None."""
+    try:
+        cur = db.execute(
+            "SELECT value FROM run_meta WHERE key = ?", ("summary",)
+        )
+        row = cur.fetchone()
+        return row["value"] if row else None
+    except sqlite3.OperationalError:
+        return None
+
+
+def _save_summary_cache(run_dir: Path, db: sqlite3.Connection, text: str) -> None:
+    """Persist a generated summary in run_meta for future renders."""
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO run_meta (key, value) VALUES (?, ?)",
+            ("summary", text),
+        )
+        db.commit()
+    except sqlite3.OperationalError:
+        pass  # table may not exist on older runs
+
+
+def _generate_run_summary(
+    analysis: Optional[dict],
+    db: sqlite3.Connection,
+    run_dir: Path,
+) -> Optional[str]:
+    """Generate or return cached summary for the run.
+
+    Uses the LLM backend if reachable; otherwise falls back to heuristic.
+    Caches the result in run_meta.
+    """
+    if analysis is None:
+        return None
+
+    cached = _get_cached_summary(run_dir, db)
+    if cached is not None:
+        return cached
+
+    from src.summarizer import generate_summary
+
+    entities = analysis.get("entities", [])
+    visual_events = analysis.get("visual_events", [])
+    audio_events = analysis.get("audio_events", [])
+    summary_text = analysis.get("summary", "")
+
+    llm_callable = None
+    if _llm_health_probe(DEFAULT_VLM_URL):
+        llm_callable = lambda prompt: _llm_call(prompt)
+
+    result = generate_summary(
+        entities=entities,
+        visual_events=visual_events,
+        audio_events=audio_events,
+        summary_text=summary_text,
+        llm_callable=llm_callable,
+    )
+
+    _save_summary_cache(run_dir, db, result)
+    return result
+
+
+def _llm_call(prompt: str) -> str:
+    """Call the llama-server backend for summarization.
+
+    Returns the first non-empty content from the response, or a
+    fallback string if the call fails.
+    """
+    try:
+        import urllib.parse
+        data = json.dumps({
+            "model": "default",
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 512,
+            "temperature": 0.3,
+        }).encode()
+        req = urllib.request.Request(
+            f"{DEFAULT_VLM_URL}/v1/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode())
+            choices = body.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+                if content:
+                    return content.strip()
+    except Exception:
+        pass
+    return "Summary unavailable – the LLM backend is not reachable."
 
 
 # ─── rendering primitives ─────────────────────────────────────────────────────
@@ -255,9 +368,18 @@ def _render_summary(run_dir: Path, analysis: Optional[dict], bundle: dict) -> No
     c5.metric("Events", n_events)
     st.caption(f"Run dir: `{run_dir}`  ·  span: {duration_s:.1f}s")
 
-    if analysis and analysis.get("summary"):
+    # Generate or retrieve cached narrative summary
+    run_summary = None
+    if analysis:
+        conn = _connect(run_dir)
+        try:
+            run_summary = _generate_run_summary(analysis, conn, run_dir)
+        finally:
+            conn.close()
+
+    if run_summary:
         st.markdown("**Summary**")
-        st.write(analysis["summary"])
+        st.write(run_summary)
 
 
 def _render_entities_table(analysis: Optional[dict]) -> None:

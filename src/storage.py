@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS ethogram_labels (
 
 CREATE INDEX IF NOT EXISTS idx_ethogram_frame ON ethogram_labels(frame_idx);
 CREATE INDEX IF NOT EXISTS idx_ethogram_profile ON ethogram_labels(profile_name);
+
+CREATE TABLE IF NOT EXISTS run_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -217,6 +222,29 @@ class TempoGraphDB:
     def clear_stages(self) -> None:
         """Clear all stage completion records (fresh run)."""
         self._conn.execute("DELETE FROM run_stages")
+        self._conn.commit()
+
+    # ── run metadata ─────────────────────────────────────────────────
+
+    def get_meta(self, key: str) -> Optional[str]:
+        """Read a run_meta value, or None."""
+        cur = self._conn.execute(
+            "SELECT value FROM run_meta WHERE key = ?", (key,)
+        )
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Store a run_meta key-value pair."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO run_meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self._conn.commit()
+
+    def delete_meta(self, key: str) -> None:
+        """Remove a run_meta key."""
+        self._conn.execute("DELETE FROM run_meta WHERE key = ?", (key,))
         self._conn.commit()
 
     # ── ethogram labels ────────────────────────────────────────────

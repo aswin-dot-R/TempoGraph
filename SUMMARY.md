@@ -1,5 +1,55 @@
 # SUMMARY — Drop → Watch → Explore UI Implementation
 
+## Follow-up (resume + summarizer)
+
+### What Was Done
+
+**Task 1 — Resume-from-DB stage guards**
+- `src/pipeline_v2.py:run()` now checks `is_stage_complete()` before every stage
+- Completed stages are skipped on resume with a log message
+- After each stage completes, `mark_stage_complete()` records the result
+- `vlm_frames` are persisted in `run_meta` for resume across Frame scoring → VLM captioning
+- Helper methods: `_load_frame_paths_from_db()`, `_load_selection_from_db()`, `_save_vlm_frames()`, `_load_vlm_frames()`
+- `src/storage.py`: new `run_meta` table + `get_meta()` / `set_meta()` / `delete_meta()`
+
+**Task 2 — Wire summarizer into Results Overview tab**
+- `ui/pages/Results.py:_render_summary()` now calls `_generate_run_summary()`
+- LLM callable resolution via 2-second HTTP health probe to `/v1/models`
+- If reachable, calls `llama-server /v1/chat/completions`; otherwise uses heuristic
+- Generated summary cached in `run_meta` table — second render returns cached value
+- Heuristic path: 5-line narrative from entities, events, audio, summary text
+
+### Acceptance Test Output
+
+```
+$ /home/ashie/anaconda3/bin/python3 -m pytest -q
+68 passed, 21 warnings
+
+$ /home/ashie/anaconda3/bin/python3 -m pytest tests/test_resume.py -q
+3 passed
+
+$ /home/ashie/anaconda3/bin/python3 -m pytest tests/test_summarizer.py -q
+8 passed
+
+$ grep -q "is_stage_complete" src/pipeline_v2.py
+→ GUARDS_WIRED ✓
+
+$ grep -qE "summarizer|generate_summary" ui/pages/Results.py
+→ SUMMARIZER WIRED ✓
+
+$ timeout 12 /home/ashie/anaconda3/bin/python3 -m streamlit run ui/app.py \
+    --server.headless true --server.port 8599
+→ UI_BOOTS ✓
+```
+
+### Known Gaps
+
+1. **Deep resume (partial pipeline)** — When resuming from mid-pipeline, some downstream variables (e.g., `selection` object) need to be reconstructed from DB. The current implementation handles Frame selection, YOLO detection, and VLM captioning resume. Edge cases around Depth estimation resume with non-contiguous frame indices are not exhaustively tested.
+
+2. **LLM backend URL is hardcoded** — `_llm_health_probe()` defaults to `http://127.0.0.1:8082`. In production, this should read from the config or session state.
+
+3. **ETA calibration not wired** — `record_stage_timing()` exists in `runtime_estimator.py` but isn't called from `pipeline_v2.run()`. This remains a TODO.
+
 ## What Changed
 
 ### New Files
@@ -9,14 +59,18 @@
 | `src/auto_profile.py` | `probe(path) → VideoFacts` + `derive_plan(facts) → DerivedPlan` — pure functions that probe video metadata via ffprobe and derive pipeline knobs per the design doc rules |
 | `src/summarizer.py` | `generate_summary()` — injectable LLM callable for narrative summaries; defaults to heuristic-based if no LLM provided |
 | `scripts/smoke_dropflow.py` | CPU end-to-end smoke test: 5s synthetic video, skip-vlm, asserts DB exists with frames and detections table |
+| `tests/test_resume.py` | Integration tests for resume-from-DB stage guards (3 tests) |
+| `tests/test_summarizer.py` | Tests for summarizer generation, heuristic fallback, and caching (8 tests) |
 
 ### Modified Files
 
 | File | Changes |
 |---|---|
 | `ui/app.py` | Complete rewrite: three-screen flow (Landing → Plan → Progress). Landing has drop zone + path input + recent runs gallery with **zero sidebar control widgets**. Plan screen shows derived plan sentence + ETA + **Analyze** button + collapsed **Adjust plan** expander with legacy knobs pre-filled. Progress screen shows stage checklist + cancel + live counters. |
-| `ui/pages/Results.py` | Added "Ask" tab with SQL-grounded Q&A (`_render_ask_tab`, `_answer_question`). Per-frame transcript join already existed (was in `_render_frame_inspector`). Dataset export tab already existed. |
+| `ui/pages/Results.py` | Added "Ask" tab with SQL-grounded Q&A (`_render_ask_tab`, `_answer_question`). Per-frame transcript join already existed (was in `_render_frame_inspector`). Dataset export tab already existed. **Follow-up:** Added narrative summary section to Overview tab with LLM health-probe resolution and DB-backed caching (`_generate_run_summary`, `_llm_health_probe`, `_llm_call`). |
 | `tests/test_pipeline_v2.py` | Fixed: test was checking `caption_chunks` but `dynamic_chunking=True` by default, so `caption_frames_dynamic` is actually called. Added mock for `caption_frames_dynamic`. |
+| `src/pipeline_v2.py` | **Follow-up:** Added resume-from-DB stage guards before every pipeline stage. `is_stage_complete()` checks skip completed stages; `mark_stage_complete()` records completion. Added `run_meta` table helper methods (`get_meta`, `set_meta`, `delete_meta`). Persisted `vlm_frames` via `run_meta` for resume across Frame scoring / VLM dedup stages. |
+| `src/storage.py` | **Follow-up:** Added `run_meta` table schema + `get_meta()`, `set_meta()`, `delete_meta()` methods to `TempoGraphDB`. |
 
 ### Existing Code (unchanged but relied upon)
 
