@@ -66,19 +66,21 @@ timeout 12 $PY -m streamlit run ui/app.py ... → UI_BOOTS
 ## Commands That Were Run
 
 ```bash
-# Full test suite
+# 1. Full test suite
 /home/ashie/anaconda3/bin/python3 -m pytest -x -q           # 57 passed
 
-# UI contract tests
+# 2. UI contract tests
 /home/ashie/anaconda3/bin/python3 -m pytest tests/test_ui_dropflow.py -q  # 15 passed
 
-# Auto-profile tests
+# 3. Auto-profile tests
 /home/ashie/anaconda3/bin/python3 -m pytest tests/test_auto_profile.py -q  # 13 passed
 
-# CPU smoke test
-/home/ashie/anaconda3/bin/python3 scripts/smoke_dropflow.py  # PASS
+# 4. CPU smoke test (exact PS spec)
+ffmpeg -y -f lavfi -i testsrc=duration=5:size=640x360:rate=10 /tmp/tg_smoke.mp4
+/home/ashie/anaconda3/bin/python3 scripts/smoke_dropflow.py /tmp/tg_smoke.mp4
+# Output: PASS: 5 frames, detections table exists
 
-# Streamlit boot test
+# 5. Streamlit headless boot
 timeout 12 /home/ashie/anaconda3/bin/python3 -m streamlit run ui/app.py \
   --server.headless true --server.port 8599
 curl -sf localhost:8599 && echo UI_BOOTS   # UI_BOOTS
