@@ -139,3 +139,98 @@ timeout 12 /home/ashie/anaconda3/bin/python3 -m streamlit run ui/app.py \
   --server.headless true --server.port 8599
 curl -sf localhost:8599 && echo UI_BOOTS   # UI_BOOTS
 ```
+
+---
+
+## 2026-07-11 — TODO items 1 & 2: mask persistence + graph-driven clip export
+
+Branch `ui-v3-dropflow`. Suite went 68 → 115 passed (47 new tests), zero
+regressions. Interpreter `/home/ashie/anaconda3/bin/python3` throughout.
+
+### Item 1 — Mask persistence (seg models pay their way)
+
+- **Schema**: `detections.mask_rle TEXT` added to `src/storage.py` SCHEMA plus
+  a guarded `PRAGMA table_info` → `ALTER TABLE` migration in
+  `TempoGraphDB.__init__` (legacy DBs migrate on open; NULL = no mask;
+  idempotent across reopens).
+- **Encoding**: new pure `src/rle.py` (numpy only, no new deps) — COCO-style
+  uncompressed RLE: column-major flatten, counts start with the zero-run,
+  `size=[H,W]`; JSON-string form persisted in the column. In
+  `ObjectDetector.detect_to_db`, seg-variant results rasterise
+  `result.masks.xyn` polygons (normalised → alignment-safe under letterbox)
+  at the saved-frame resolution and store one RLE per detection.
+- **Rendering**: new streamlit-free `src/annotate.py`
+  (`draw_detections`/`draw_masks`/`apply_depth_overlay`/
+  `build_annotated_video`) shared by `ui/pages/Results.py` and the new
+  `scripts/annotate_video.py` CLI. Frame inspector gained a **Masks**
+  checkbox (semi-transparent fill, per-entity colour keyed on track id, on
+  by default when the run has masks); the annotated-video tab gained a Masks
+  toggle and the CLI carries the `--masks` flag.
+- Also fixed a latent AppTest-visible crash: the overview and entity-inspector
+  event timelines produced duplicate auto-generated plotly IDs (now keyed),
+  and `RESULTS_DIR` is overridable via `TEMPOGRAPH_RESULTS_DIR` for fixtures.
+
+**Acceptance (pasted):**
+
+```
+$ python3 -m pytest tests/test_rle.py -q                 # RLE round-trip property tests
+11 passed in 1.02s
+$ python3 -m pytest tests/test_mask_persistence.py -q    # migration + CPU seg smoke (5 s testsrc)
+7 passed in 3.34s
+$ python3 -m pytest tests/test_results_apptest.py -q     # AppTest: inspector on masked fixture DB
+6 passed in 4.24s
+
+# CPU seg smoke, 5 s ffmpeg testsrc clip, yolo26n-seg.pt (repo root):
+seg smoke run: 21 detections, 21 with non-NULL mask_rle
+$ python3 scripts/annotate_video.py <segrun> --masks --min-conf 0.01
+wrote .../segrun/annotated_strip.mp4 (0.10 MB)
+```
+
+Note: `testsrc` is an abstract pattern, so the smoke run uses conf 0.01 —
+the (spurious but deterministic) instances are exactly what is needed to
+prove masks flow detector → RLE → DB → overlay. `yolo26n-seg.pt` was copied
+from `~/TempoGraph` into the worktree root (gitignored via `*.pt`).
+
+### Item 2 — Graph-driven clip export
+
+- **`src/clip_export.py`**:
+  `select_events(db, entity=None, behavior=None, time_range=None)` accepts a
+  `tempograph.db` path or run dir; events come from `analysis.json`
+  `visual_events` (the graph's edges) plus contiguous same-behavior
+  `ethogram_labels` runs in the DB (ethogram spans are skipped when an entity
+  filter is set, as they are not entity-scoped). Each event is padded ±1.5 s
+  (start clamped at 0) and overlapping/touching spans merge with
+  " + "-joined labels — the pure `pad_and_merge` helper is unit-tested
+  directly. `export_clips(video_path, spans, out_dir, montage=False)` cuts
+  one mp4 per span: stream-copy first, ffprobe-verified, accurate re-encode
+  fallback when keyframes misalign; `montage=True` concatenates with `xfade`
+  crossfades (0.25 s) and burned-in `drawtext` label lower-thirds (label-less
+  fallback if drawtext is unavailable).
+- **UI**: new **Graph** tab in `ui/pages/Results.py` hosting the pyvis entity
+  graph (previously only under Files) and the **Clips** section:
+  entity/behavior pickers built from existing graph data, live span-preview
+  table, source-video path input (defaults from the new `run_meta.video_path`
+  that `pipeline_v2` now persists), Export button, montage toggle, and
+  per-clip download buttons.
+
+**Acceptance (pasted):**
+
+```
+$ python3 -m pytest tests/test_clip_export.py -q   # span math units + ffmpeg integration
+23 passed in 7.06s
+
+# End-to-end on a fixture run + 14 s ffmpeg testsrc source:
+spans: [(500, 4500, 'approach: dog_1'), (6500, 13500, 'interact: dog_1, person_1 + grooming')]
+clip_000_approach_dog_1.mp4: want 4.00s got 4.00s (delta 0.000s)
+clip_001_interact_dog_1_person_1_grooming.mp4: want 7.00s got 7.00s (delta 0.000s)
+montage: montage.mp4 duration 10.77s size 116 kB   # 4 + 7 − 0.25 s crossfade, ffprobe-valid h264
+```
+
+### Full suite
+
+```
+$ /home/ashie/anaconda3/bin/python3 -m pytest -q
+115 passed, 21 warnings in 16.99s
+```
+
+Commits: `b6b0353` (item 1), `a1c92cc` (item 2).
