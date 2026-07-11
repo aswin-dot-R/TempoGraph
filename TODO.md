@@ -1,209 +1,134 @@
-# TempoGraph TODO
+# TempoGraph TODO — post-v3 roadmap
 
-Tracking forward work for the v2-only branch. Triaged by effort × value.
-File:line references point at where each change would land.
+Last updated: 2026-07-11, after the ui-v3-dropflow work (see `SUMMARY.md`).
+Supersedes the 2026-04-28 TODO: of that list, dataset-exporter wiring,
+per-frame transcript join, stop button, ETA calibration, and resume-from-DB
+are ALL DONE (verified, 68 tests). Mask persistence remains and is item 1.
 
-Last updated: 2026-04-28.
+## Instructions for the autonomous agent working this file
 
----
+Work items top to bottom, one item per session unless told otherwise. For
+each item: implement → test → run the item's ACCEPTANCE → commit (imperative
+message, one commit per item minimum) → append a dated entry to `SUMMARY.md`.
+A component that exists but is never called does not count as done — every
+item's acceptance includes an integration-level check. Finish with
+`git status --porcelain` empty.
 
-## Tier 1 — small effort, real value (do first)
+**Environment facts (verified, do not rediscover):**
+- Interpreter: `/home/ashie/anaconda3/bin/python3` (streamlit 1.51, pytest,
+  torch 2.13+cu130, cv2 4.13, networkx, pyvis). Tests:
+  `/home/ashie/anaconda3/bin/python3 -m pytest -q` — currently 68 pass; keep
+  them green.
+- `ffmpeg`/`ffprobe` on PATH. Sample footage:
+  `/home/ashie/Downloads/output_1080p30_brandy.mp4` (copy, never modify).
+- Existing run databases for fixtures: `results/*/tempograph.db`.
 
-### Wire `dataset_exporter` into the UI
-- **Status**: module shipped on `52b9217`, never wired to UI
-- **Code**: `src/dataset_exporter.py` already has `export_coco_annotations`,
-  `export_captions_jsonl`, `export_frame_captions_jsonl`, `export_all`
-- **Add**: new "Dataset" tab in `ui/pages/Results.py` with:
-  - "Build COCO + JSONL" button → calls `export_all(run_dir)`
-  - class-distribution histogram
-  - sample image per class grid
-  - download-zip button for `<run_dir>/exports/`
-- **Effort**: ~1 hour, ~80 LOC
-
-### Per-frame transcript join in Frame inspector
-- **Status**: not started
-- **Code**: `ui/pages/Results.py:_render_frame_inspector()` (around line 333)
-- **Add**: SQL join of `audio_segments` against the current frame's
-  `timestamp_ms` to show what was being said at that moment, in a
-  "Transcript at this timestamp" box next to the detections table
-- **Query already shown in `docs/PIPELINE.md:Storage schema`**:
-  ```sql
-  SELECT a.text FROM audio_segments a JOIN frames f
-    ON a.start_ms <= f.timestamp_ms AND a.end_ms > f.timestamp_ms
-    WHERE f.frame_idx = ?;
-  ```
-- **Effort**: ~20 LOC
-
-### Stop button mid-run
-- **Status**: not started; today you can only kill the streamlit process
-- **Approach**: `threading.Event` passed into `PipelineV2.run()`, checked
-  between stages and inside the chunk loop
-- **Code**: `src/pipeline_v2.py:PipelineV2.__init__` add `cancel_event`
-  param; `_stage()` calls check it; `caption_chunks` callback can also
-  check it. `ui/app.py` wires a "Cancel" button that sets the event.
-- **Effort**: ~30 LOC, requires care that partial DB writes don't leave
-  the run in an unrecoverable state (it doesn't — DB rows are
-  per-frame-idempotent, but `chunks.json` would be partial; that's
-  acceptable since the user explicitly asked for stop)
-
-### Calibrate ETA from past runs
-- **Status**: not started; ETA constants in `src/runtime_estimator.py`
-  are hand-tuned and the Jurassic Park run blew past by 17 min
-- **Approach**: append `(stage_name, elapsed_s, n_input_units)` to
-  `results/.calibration.jsonl` after each run. Estimator reads the
-  most recent N entries per stage and fits a simple linear model.
-- **Effort**: ~50 LOC. Self-improving every time you run.
+**FORBIDDEN:** `sudo`, `systemctl`, `pip install`, starting/stopping any
+llama-server, pushing to git remotes, allocating memory on the AMD GPU (it
+serves the model running you). GPU work only on CUDA device 0 (RTX 3060)
+and only where an item explicitly says so. Items marked **[USER-SUPERVISED]**
+must NOT be attempted unattended — skip them.
 
 ---
 
-## Tier 2 — medium effort, real value
+## 1. Mask persistence — make the seg models pay their way
 
-### Mask persistence (so the seg variant pays its way)
-- **Status**: seg variant computes masks every frame and discards them
-- **Schema change** (`src/storage.py`):
-  ```sql
-  ALTER TABLE detections ADD COLUMN mask_rle TEXT;
-  -- OR: mask_npy_path TEXT (lighter on the DB, heavier on disk)
-  ```
-- **Code**: `src/modules/detector.py:detect_to_db` — when seg model is
-  loaded, encode each result's mask polygon to COCO RLE (use
-  `pycocotools` if available, else simple run-length) and store
-- **Bonus**: render masks in the Results page Annotated video tab and
-  Frame inspector overlay
-- **Effort**: ~80 LOC + new dep (`pycocotools` for RLE)
+**Why:** `yolo26*-seg` variants compute instance masks every frame and throw
+them away. Persisting them unlocks mask overlays and future dataset exports.
 
-### Resume-from-DB on crash
-- **Status**: long runs fail and start from scratch
-- **Approach**: at run start, check `db.count_frames()`,
-  `db.count_detections()`, `db.count_audio_segments()`. If a stage's
-  output already exists for the input set, skip that stage.
-- **Code**: `src/pipeline_v2.py:run()` — guard each stage's
-  `_stage("X", "start")` block on a presence check
-- **Risk**: distinguishing "already done" from "partial run that
-  crashed mid-stage". Solution: write a `runs(run_id, stage,
-  finished_at)` table that explicitly records stage completion.
-- **Effort**: ~60 LOC + 1 new table
+- Schema (`src/storage.py`): `ALTER TABLE detections ADD COLUMN mask_rle TEXT`
+  (guard with a migration that tolerates existing DBs; NULL = no mask).
+- Encode: in the detection stage, when the loaded model is a seg variant,
+  encode each mask to COCO-style RLE. Write a small pure `src/rle.py`
+  (encode/decode, no new deps) with round-trip unit tests.
+- Render: Frame inspector (`ui/pages/Results.py`) overlays decoded masks
+  (semi-transparent fill, per-entity colour) when `mask_rle` is present;
+  annotated-video path gains a `--masks` flag.
+- **Acceptance:** RLE round-trip property test (random binary masks); CPU
+  smoke run with the seg model on a 5 s synthetic clip → ≥ 1 detection row
+  with non-NULL `mask_rle`; AppTest renders the inspector without error on
+  a fixture DB containing masks. Suite green.
 
-### GitHub Actions CI
-- **Status**: nothing on push/PR currently
-- **Add**: `.github/workflows/ci.yml`:
-  - matrix Python 3.10/3.11/3.12
-  - install (no whisper.cpp build — too slow for CI; mock it via
-    pytest fixtures)
-  - run `make test`
-- **Effort**: ~30 LOC YAML
+## 2. Graph-driven clip export — "give me a cut of every event where X"
 
-### Multimodal correlations viz
-- **Status**: aggregator produces `multimodal_correlations` array but
-  Results page never displays it
-- **Add**: a sub-section in the Overview tab that renders the audio↔visual
-  links as connector lines on the existing Plotly Gantt timeline
-- **Code**: `ui/pages/Results.py:_render_events_timeline` add
-  `add_shape(...)` for each correlation
-- **Effort**: ~80 LOC
+**Why:** the graph knows what happened when; ffmpeg can cut it. This turns
+TempoGraph from an analysis tool into an editing tool.
 
-### YOLO bbox bug back-fill
-- **Status**: runs from before 2026-04-27 have bboxes normalised against
-  source video dims instead of saved JPEG dims
-- **Fix**: write a one-shot script `scripts/fix_legacy_bboxes.py` that
-  reads each old run's `tempograph.db`, looks up the saved JPEG width,
-  and rescales the rows
-- **Effort**: ~40 LOC
+- `src/clip_export.py`: `select_events(db, entity=None, behavior=None,
+  time_range=None) -> [(start_ms, end_ms, label)]` (pad each event ±1.5 s,
+  merge overlapping spans) and `export_clips(video_path, spans, out_dir,
+  montage=False)` — per-event mp4s via ffmpeg (stream-copy where keyframes
+  allow, re-encode fallback); `montage=True` concatenates with crossfade
+  and burned-in label lower-thirds.
+- UI: "Clips" section in the Graph tab — pick entity and/or behavior from
+  existing graph data, preview span list, Export button, download links.
+- **Acceptance:** unit tests for span padding/merge math; integration test
+  on a fixture DB + synthetic video → N event rows yield N clip files whose
+  ffprobe durations match spans ±0.5 s; montage ffprobe-valid; AppTest
+  renders the Clips section. Suite green.
 
----
+## 3. Cross-run entity registry — the archive remembers
 
-## Tier 3 — bigger projects
+**Why:** every run is an island; longitudinal questions ("every appearance
+of the brown dog, any video") need identity across runs.
 
-### Dataset generation mode (UI + class filter + YOLO-World)
-- **Status**: discussed, partial backend (`dataset_exporter.py` exists)
-- **Scope**: sidebar mode toggle (Analysis / Dataset generation), class
-  selector (closed = COCO-80, open = YOLO-World text classes), filter
-  flags (min confidence, min frames per class, include negatives), train/
-  val/test split, dedicated Results-page "Dataset" tab with class
-  distribution histogram + sample-per-class grid + zip download
-- **Effort**: half-day, ~250 LOC across `ui/app.py`,
-  `ui/pages/Results.py`, `src/modules/detector.py` (class filter via
-  `model.predict(classes=[...])` for closed-vocab,
-  `model.set_classes([...])` for YOLO-World), `src/dataset_exporter.py`
+- `src/entity_registry.py` + a global `registry.db` beside `results/`:
+  table `canonical_entities(id, label, embedding BLOB, first_seen,
+  last_seen, run_count)`. Matching: normalised-label match first; where
+  entity crops exist, cosine similarity of torchvision
+  `mobilenet_v3_small` features (CPU) with threshold 0.75; else create a
+  new canonical id. If weights can't load offline, fall back to label-only
+  and say so in SUMMARY.
+- Wire: at the end of a pipeline run, upsert entities into the registry
+  (config flag `registry_enabled`, default True).
+- UI: new "Archive" page — canonical entity list with per-run appearance
+  counts; clicking one lists runs + timestamps.
+- **Acceptance:** matcher unit tests (same label → same id; distinct → new
+  ids; threshold respected with synthetic embeddings); integration: two
+  fixture run DBs sharing a label → ONE canonical row, run_count 2; AppTest
+  renders Archive page. Suite green.
 
-### VLM-as-classifier mode for novel classes
-- **Status**: discussed
-- **Scope**: per-frame call to qwen with prompt "From this list [X, Y, Z],
-  which are present? Output JSON." Slow (~5 s/frame) but most accurate
-  open-vocab labels with no bbox.
-- **Effort**: ~80 LOC, ~50× slower than YOLO so should be a separate
-  detector mode (not the default)
+## 4. Archive-wide Ask (GraphRAG-lite) — depends on item 3
 
-### SAM masks for novel classes
-- **Pattern**: YOLO-World detects bboxes → feed each into Segment
-  Anything for the mask. Two-pass, slower, but works for any vocabulary.
-- **Effort**: ~120 LOC + SAM model dep (~600 MB) + extra inference cost
+- `src/archive_index.py`: chunk all runs' captions + transcript segments
+  (run id + timestamp attached), TF-IDF retriever (sklearn available) with
+  the interface designed so an embedding endpoint can replace it later;
+  persist the index beside the registry.
+- `answer_archive(question)`: top-k chunks across runs → the SAME
+  injectable LLM callable the summarizer uses (health-probe resolution;
+  heuristic fallback = extractive top-3 chunks with citations).
+- UI: "Ask the archive" box on the Archive page; every answer cites
+  run + timestamp, clickable through to that run's Results.
+- **Acceptance:** retriever unit test (unique planted phrase in fixture run
+  A retrieved for a matching query, not from run B); AppTest with fake LLM
+  → answer renders with ≥ 1 citation; heuristic path renders without an
+  LLM. Suite green.
 
-### Docker image for v2-only
-- **Status**: v1 Dockerfiles deleted on this branch
-- **Scope**: new `Dockerfile` that bakes in conda env + whisper.cpp
-  build + Streamlit. Optional second image with llama.cpp + Qwen
-  weights baked in (~13 GB image — only worth it if shipping to
-  non-experts).
-- **Effort**: ~150 LOC + a few hours of build-and-test cycles
+## 5. Ethogram v2 — from viewer to instrument
 
-### PyPI package
-- **Scope**: `pyproject.toml` for `pip install tempograph`. Doesn't
-  cover whisper.cpp or llama-server (still need bootstrap), but
-  simplifies the Python-side install.
-- **Effort**: ~50 LOC + first-time package publishing setup
+- `src/ethology.py`: from event edges → per-entity time budgets (fraction
+  of observed time per behavior), behavior transition matrix
+  (row-normalised), bout statistics (mean/median bout duration). Pure
+  functions over the DB, unit-tested against a hand-built fixture with
+  known answers.
+- UI: Ethogram page gains stacked time-budget bars per entity, transition
+  heatmap, bout table with CSV download.
+- **Acceptance:** fixture tests with exact expected values; AppTest renders
+  all three panels; CSV parses. Suite green.
+
+## 6. [USER-SUPERVISED] Live mode + Hermes alerts — DO NOT run unattended
+
+RTSP/webcam rolling analysis with event alerts through the user's Hermes
+gateway. Requires cameras, service coordination, and GPU-budget decisions
+an unattended agent must not make. Sketch: `src/live_runner.py` ring-buffer
+ingestion → periodic mini-pipeline over the last N seconds → event diff →
+alert hook (shell-out to `hermes` CLI). Design doc first, with the user.
 
 ---
 
-## Known issues / footguns
+## Done in v3 (for the record)
 
-These don't block anything but should be on the radar:
-
-1. **`requirements.txt` openai-whisper / depth-anything-v2 lines are
-   commented out** — neither is needed for v2 (whisper.cpp + transformers
-   replace them). If anyone uncomments them, install will fail on
-   `depth-anything-v2>=1.0.0` (PyPI only has 0.1.0).
-2. **AMD radv `vk::DeviceLostError`** intermittently when whisper-cli
-   targets Vulkan device 0. Pipeline auto-falls-back to NVIDIA → CPU now,
-   but it's still a flake. Worth filing upstream against radv if it keeps
-   happening.
-3. **Filename-keyed output dirs** — uploading two videos with the same
-   filename overwrites the first run. Hash-suffix the output dir if it
-   exists to avoid silent data loss.
-4. **Streamlit upload limit raised to 4 GB** via `.streamlit/config.toml`.
-   The whole upload sits in Python RAM during `uploaded.read()`. Switch
-   to streaming `uploaded.read(chunk_size)` if memory ever becomes an
-   issue.
-5. **Mask discard** — the seg variant of YOLO computes instance masks
-   but they aren't persisted (no `mask_*` columns). See Tier 2 above.
-6. **Pre-2026-04-27 bbox bug** — runs from before that date have bboxes
-   normalised against source video dims instead of saved JPEG dims. See
-   Tier 2 back-fill script.
-7. **Aggregator + 100k context** — single-pass aggregator works up to
-   30 chunks (`single_pass_max_chunks=30`); beyond that switches to
-   hierarchical compression in `_compress_hierarchical()`. Watch the
-   aggregator row in the live context-window panel; if it goes
-   orange/red, hierarchical is already saving you.
-8. **Service unit hard-codes LM Studio paths** — `qwen35-turboquant.service`
-   ExecStart points at `/home/ashie/.lmstudio/models/...`. Brittle if
-   LM Studio reorganises. `bootstrap.sh --with-llm` writes a separate,
-   independent unit (`qwen-tempograph.service`) — recommend migrating.
-
----
-
-## Recently shipped (last week)
-
-- v2-only branch: legacy pipeline removed, one-line installer
-  (`Makefile` + `bootstrap.sh` + `QUICKSTART.md`)
-- VLM frame dedup with keyframe-protection (Stage 4.5)
-- Entity-ID persistence across chunks (registry + `NEW_ENTITIES:` line)
-- Whisper GPU fallback chain (NVIDIA → AMD → CPU)
-- Dataset exporter module (COCO + JSONL) — *not yet wired to UI*
-- Batch runner module — *CLI only, no UI yet*
-- Live elapsed timer + ETA + per-stage cost breakdown in UI
-- Live VLM context-window panel (per-chunk token usage with peak indicator)
-- Interactive timeline with click-to-seek on the annotated video
-- `docs/PIPELINE.md` (1011 lines) — deep technical doc
-- Bbox normalisation bug fix (saved JPEG dims, not source video dims)
-- Depth backend swap from `depth-anything-v2` PyPI pkg → `transformers`
-  pipeline (auto-downloads weights from HF)
+Drop→plan→progress UI, auto_profile, per-run Ask tab, summarizer with
+LLM/heuristic paths + caching, resume-from-DB guards, cancel, ETA
+calibration, dataset-exporter tab, per-frame transcript join, CPU smoke
+harness. 68 tests.
