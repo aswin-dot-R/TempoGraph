@@ -846,6 +846,118 @@ def _render_video_player(run_dir: Path, bundle: dict) -> None:
     st.video(str(out_path))
 
 
+def _render_graph_tab(run_dir: Path, bundle: dict,
+                      analysis: Optional[dict]) -> None:
+    """Entity graph (pyvis) plus graph-driven clip export."""
+    st.subheader("Entity graph")
+    graph_html = run_dir / "graph.html"
+    if graph_html.exists():
+        st.components.v1.html(graph_html.read_text(), height=600,
+                              scrolling=True)
+    else:
+        st.info("No `graph.html` for this run (aggregation not completed).")
+
+    st.divider()
+    _render_clips_section(run_dir, analysis)
+
+
+def _render_clips_section(run_dir: Path, analysis: Optional[dict]) -> None:
+    """Clips: cut an mp4 of every event matching an entity and/or behavior."""
+    from src.clip_export import export_clips, select_events
+
+    st.subheader("Clips")
+    st.caption(
+        "Cut a clip of every graph event involving the chosen entity "
+        "and/or behavior. Each event is padded ±1.5 s; overlapping spans "
+        "are merged."
+    )
+
+    events = (analysis or {}).get("visual_events", []) or []
+    entities = sorted({str(e) for ev in events
+                       for e in (ev.get("entities") or [])})
+    behaviors = {str(ev.get("type", "")) for ev in events if ev.get("type")}
+    try:
+        with _connect(run_dir) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT behavior FROM ethogram_labels"
+            ).fetchall()
+        behaviors |= {r[0] for r in rows}
+    except sqlite3.OperationalError:
+        pass
+    behaviors_list = sorted(behaviors)
+
+    if not entities and not behaviors_list:
+        st.info("No graph events available for this run yet.")
+        return
+
+    c1, c2 = st.columns(2)
+    entity = c1.selectbox("Entity", ["(any)"] + entities, key="clips_entity")
+    behavior = c2.selectbox("Behavior", ["(any)"] + behaviors_list,
+                            key="clips_behavior")
+
+    spans = select_events(
+        run_dir / "tempograph.db",
+        entity=None if entity == "(any)" else entity,
+        behavior=None if behavior == "(any)" else behavior,
+    )
+    if not spans:
+        st.write("_no events match the current filters_")
+        return
+
+    st.markdown(f"**{len(spans)} clip span(s)** after padding + merge:")
+    st.dataframe(
+        [{"start_s": round(s / 1000.0, 2), "end_s": round(e / 1000.0, 2),
+          "duration_s": round((e - s) / 1000.0, 2), "label": label}
+         for s, e, label in spans],
+        use_container_width=True, hide_index=True,
+    )
+
+    default_src = ""
+    try:
+        with _connect(run_dir) as conn:
+            row = conn.execute(
+                "SELECT value FROM run_meta WHERE key = 'video_path'"
+            ).fetchone()
+        if row and Path(row["value"]).exists():
+            default_src = row["value"]
+    except sqlite3.OperationalError:
+        pass
+    src = st.text_input("Source video path", value=default_src,
+                        key="clips_src",
+                        help="The original video the run was computed from "
+                             "(timestamps map to this file).")
+    montage = st.checkbox("Also build a montage (crossfades + labels)",
+                          value=False, key="clips_montage")
+
+    clips_dir = run_dir / "clips"
+    if st.button("Export clips", type="primary", key="clips_export"):
+        if not src or not Path(src).exists():
+            st.error("Source video path is empty or does not exist.")
+        else:
+            try:
+                with st.spinner(f"Cutting {len(spans)} clip(s) with ffmpeg..."):
+                    result = export_clips(src, spans, clips_dir,
+                                          montage=montage)
+                n = len(result["clips"])
+                msg = f"Exported {n} clip(s) to `{clips_dir}`"
+                if result["montage"]:
+                    msg += " + montage.mp4"
+                st.success(msg)
+            except Exception as e:
+                st.error(f"Export failed: {e}")
+
+    if clips_dir.exists():
+        existing = sorted(clips_dir.glob("*.mp4"))
+        if existing:
+            st.markdown("**Download**")
+            for f in existing:
+                st.download_button(
+                    f"⬇ {f.name} ({f.stat().st_size / 1e6:.2f} MB)",
+                    data=f.read_bytes(), file_name=f.name, mime="video/mp4",
+                    key=f"clips_dl_{f.name}",
+                )
+
+
 def _load_chunks(run_dir: Path) -> Optional[list]:
     f = run_dir / "chunks.json"
     if not f.exists():
@@ -1371,9 +1483,9 @@ def main() -> None:
     analysis = _load_analysis(run_dir)
     bundle = _load_run_bundle(str(run_dir))
 
-    (overview, frame_tab, entity_tab, vlm_tab, captions_tab,
+    (overview, frame_tab, entity_tab, graph_tab, vlm_tab, captions_tab,
      interactive_tab, video_tab, ask_tab, dataset_tab, files_tab) = st.tabs(
-        ["Overview", "Frame inspector", "Entity inspector",
+        ["Overview", "Frame inspector", "Entity inspector", "Graph",
          "VLM (Qwen) outputs", "Captions",
          "Interactive timeline", "Annotated video",
          "Ask", "Dataset export", "Files"]
@@ -1403,6 +1515,9 @@ def main() -> None:
 
     with entity_tab:
         _render_entity_inspector(bundle, analysis)
+
+    with graph_tab:
+        _render_graph_tab(run_dir, bundle, analysis)
 
     with vlm_tab:
         _render_vlm_chunks(run_dir, bundle)

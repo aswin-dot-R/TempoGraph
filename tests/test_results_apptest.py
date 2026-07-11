@@ -111,3 +111,39 @@ class TestFrameInspectorWithMasks:
         at.checkbox(key="insp_masks").set_value(True)
         at.run(timeout=60)
         assert not at.exception
+
+
+class TestGraphTabClipsSection:
+    def test_clips_section_renders(self, fixture_results_dir):
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(RESULTS_PAGE))
+        at.run(timeout=60)
+        assert not at.exception
+        subheaders = [s.value for s in at.subheader]
+        assert "Clips" in subheaders
+        assert "Entity graph" in subheaders
+
+    def test_clips_controls_and_span_preview(self, fixture_results_dir):
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(RESULTS_PAGE))
+        at.run(timeout=60)
+        ent = at.selectbox(key="clips_entity")
+        beh = at.selectbox(key="clips_behavior")
+        assert ent.options == ["(any)", "dog_1", "person_1"]
+        assert "approach" in beh.options and "interact" in beh.options
+        assert at.button(key="clips_export") is not None
+        # span preview dataframe: the two fixture events merge into one span
+        # (00:00-00:01 and 00:01-00:02 overlap after +-1.5 s padding)
+        dfs = at.dataframe
+        assert any("label" in df.value.columns for df in dfs)
+
+    def test_clips_filter_reruns_without_error(self, fixture_results_dir):
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(RESULTS_PAGE))
+        at.run(timeout=60)
+        at.selectbox(key="clips_behavior").set_value("approach")
+        at.run(timeout=60)
+        assert not at.exception

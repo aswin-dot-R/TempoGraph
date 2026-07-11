@@ -176,6 +176,12 @@ class PipelineV2:
 
         db = TempoGraphDB(out_dir / "tempograph.db")
         try:
+            # Remember the source video so post-hoc tools (e.g. clip
+            # export) can find it without user input.
+            try:
+                db.set_meta("video_path", str(self.config.video_path))
+            except Exception as e:
+                self.logger.warning(f"could not persist video_path: {e}")
             # Declare variables used across stages
             frame_paths: List[Path] = []
             selection: dict = {}
