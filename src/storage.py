@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS detections (
     y2 REAL NOT NULL,
     confidence REAL NOT NULL,
     mean_depth REAL,
+    mask_rle TEXT,
     FOREIGN KEY (frame_idx) REFERENCES frames(frame_idx)
 );
 
@@ -80,7 +81,24 @@ class TempoGraphDB:
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring pre-existing databases up to the current schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves old tables untouched, so columns
+        added later must be back-filled with ALTER TABLE. NULL means absent
+        (e.g. mask_rle is NULL for bbox-only detections).
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(detections)")
+        }
+        if "mask_rle" not in cols:
+            self._conn.execute(
+                "ALTER TABLE detections ADD COLUMN mask_rle TEXT"
+            )
 
     def has_table(self, name: str) -> bool:
         cur = self._conn.execute(
@@ -126,12 +144,15 @@ class TempoGraphDB:
         y2: float,
         confidence: float,
         mean_depth: Optional[float] = None,
+        mask_rle: Optional[str] = None,
     ) -> int:
         cur = self._conn.execute(
             "INSERT INTO detections "
-            "(frame_idx, track_id, class_name, x1, y1, x2, y2, confidence, mean_depth) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (frame_idx, track_id, class_name, x1, y1, x2, y2, confidence, mean_depth),
+            "(frame_idx, track_id, class_name, x1, y1, x2, y2, confidence, "
+            "mean_depth, mask_rle) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (frame_idx, track_id, class_name, x1, y1, x2, y2, confidence,
+             mean_depth, mask_rle),
         )
         self._conn.commit()
         return cur.lastrowid

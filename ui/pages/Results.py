@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import html as html_lib
 import json
+import os
 import sqlite3
 import sys
 import urllib.request
@@ -18,8 +19,18 @@ import plotly.express as px
 import streamlit as st
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RESULTS_DIR = REPO_ROOT / "results"
+# Overridable so tests (and alternate archives) can point at a fixture dir.
+RESULTS_DIR = Path(
+    os.environ.get("TEMPOGRAPH_RESULTS_DIR", str(REPO_ROOT / "results"))
+)
 sys.path.insert(0, str(REPO_ROOT))
+
+from src.annotate import (  # noqa: E402
+    build_annotated_video,
+    draw_detections as _draw_detections,
+    draw_masks as _draw_masks,
+)
+from src.annotate import apply_depth_overlay as _apply_depth_overlay_abs  # noqa: E402
 
 
 # ─── data access ──────────────────────────────────────────────────────────────
@@ -208,67 +219,20 @@ def _llm_call(prompt: str) -> str:
     return "Summary unavailable – the LLM backend is not reachable."
 
 
-# ─── rendering primitives ─────────────────────────────────────────────────────
-
-_PALETTE = [
-    (66, 165, 245), (102, 187, 106), (239, 83, 80),
-    (255, 167, 38), (171, 71, 188), (38, 198, 218),
-    (236, 64, 122), (141, 110, 99),
-]
-
-
-def _color_for(key: str, seen: Dict[str, Tuple[int, int, int]]) -> Tuple[int, int, int]:
-    if key not in seen:
-        seen[key] = _PALETTE[len(seen) % len(_PALETTE)]
-    return seen[key]
-
-
-def _draw_detections(image_bgr: np.ndarray, dets: List[dict],
-                     min_conf: float = 0.0,
-                     highlight_classes: Optional[set] = None) -> np.ndarray:
-    img = image_bgr.copy()
-    h, w = img.shape[:2]
-    seen: Dict[str, Tuple[int, int, int]] = {}
-    for d in dets:
-        if d["confidence"] < min_conf:
-            continue
-        cls = d["class_name"]
-        color = _color_for(cls, seen)
-        if highlight_classes and cls not in highlight_classes:
-            color = (120, 120, 120)
-        x1 = max(0, int(d["x1"] * w)); y1 = max(0, int(d["y1"] * h))
-        x2 = min(w - 1, int(d["x2"] * w)); y2 = min(h - 1, int(d["y2"] * h))
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-        depth_str = f" d={d['mean_depth']:.2f}" if d.get("mean_depth") is not None else ""
-        label = f"{cls} {d['confidence']:.2f}{depth_str}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        cv2.rectangle(img, (x1, max(0, y1 - th - 4)), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(img, label, (x1 + 2, max(th, y1 - 2)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-    return img
-
+# ─── rendering primitives (shared with src/annotate.py) ──────────────────────
 
 def _apply_depth_overlay(image_bgr: np.ndarray, depth_npy_path: Optional[str],
                          alpha: float = 0.45) -> np.ndarray:
     if not depth_npy_path:
         return image_bgr
-    p = _resolve(depth_npy_path)
-    if not p.exists():
-        return image_bgr
-    try:
-        depth = np.load(str(p))
-    except Exception:
-        return image_bgr
-    h, w = image_bgr.shape[:2]
-    if depth.shape != (h, w):
-        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-    d_min, d_max = float(depth.min()), float(depth.max())
-    if d_max > d_min:
-        norm = ((depth - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-    else:
-        norm = np.zeros_like(depth, dtype=np.uint8)
-    colored = cv2.applyColorMap(norm, cv2.COLORMAP_INFERNO)
-    return cv2.addWeighted(image_bgr, 1.0 - alpha, colored, alpha, 0.0)
+    return _apply_depth_overlay_abs(
+        image_bgr, str(_resolve(depth_npy_path)), alpha=alpha
+    )
+
+
+def _has_masks(det_by_frame: Dict[int, List[dict]]) -> bool:
+    return any(d.get("mask_rle") for dets in det_by_frame.values()
+               for d in dets)
 
 
 def _bgr_to_png_bytes(img_bgr: np.ndarray) -> bytes:
@@ -475,7 +439,8 @@ def _render_events_timeline(analysis: Optional[dict],
         legend_title="event type",
     )
     fig.update_traces(textposition="inside", insidetextanchor="start")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True,
+                    key=f"events_timeline_{highlight_entity or 'all'}")
 
 
 def _render_frame_thumbnails(run_dir: Path, bundle: dict) -> None:
@@ -545,11 +510,14 @@ def _render_frame_inspector(run_dir: Path, bundle: dict,
     )
     fr = next(f for f in frames if f["frame_idx"] == chosen_idx)
 
-    c1, c2, c3 = st.columns([1, 1, 2])
+    masks_available = _has_masks(det_by_frame)
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     show_dets = c1.checkbox("Detections", value=True, key="insp_dets")
-    show_depth = c2.checkbox("Depth heatmap", value=bool(depth_by_frame),
+    show_masks = c2.checkbox("Masks", value=masks_available,
+                             key="insp_masks", disabled=not masks_available)
+    show_depth = c3.checkbox("Depth heatmap", value=bool(depth_by_frame),
                               key="insp_depth", disabled=not depth_by_frame)
-    min_conf = c3.slider("Min confidence", 0.0, 1.0, 0.25, 0.05, key="insp_conf")
+    min_conf = c4.slider("Min confidence", 0.0, 1.0, 0.25, 0.05, key="insp_conf")
 
     img_path = _resolve(fr["image_path"])
     img = cv2.imread(str(img_path))
@@ -558,6 +526,9 @@ def _render_frame_inspector(run_dir: Path, bundle: dict,
         return
     if show_depth:
         img = _apply_depth_overlay(img, depth_by_frame.get(chosen_idx))
+    if show_masks:
+        img = _draw_masks(img, det_by_frame.get(chosen_idx, []),
+                          min_conf=min_conf)
     if show_dets:
         img = _draw_detections(img, det_by_frame.get(chosen_idx, []),
                                min_conf=min_conf)
@@ -816,47 +787,25 @@ def _render_entity_inspector(bundle: dict, analysis: Optional[dict]) -> None:
 
 def _build_annotated_video(run_dir: Path, bundle: dict, fps: float,
                            show_dets: bool, show_depth: bool,
-                           min_conf: float) -> Optional[Path]:
+                           min_conf: float,
+                           show_masks: bool = False) -> Optional[Path]:
     frames = bundle["frames"]
     if not frames:
         return None
-    first_path = _resolve(frames[0]["image_path"])
-    sample = cv2.imread(str(first_path))
-    if sample is None:
-        return None
-    h, w = sample.shape[:2]
-    out_path = run_dir / "annotated_strip.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-    if not writer.isOpened():
-        out_path = run_dir / "annotated_strip.avi"
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-        if not writer.isOpened():
-            return None
-
-    det_by_frame = bundle["det_by_frame"]
-    depth_by_frame = bundle["depth_by_frame"]
     progress = st.progress(0.0, text="Encoding annotated video...")
-    for i, fr in enumerate(frames):
-        img = cv2.imread(str(_resolve(fr["image_path"])))
-        if img is None:
-            continue
-        if img.shape[:2] != (h, w):
-            img = cv2.resize(img, (w, h))
-        if show_depth:
-            img = _apply_depth_overlay(img, depth_by_frame.get(fr["frame_idx"]))
-        if show_dets:
-            img = _draw_detections(img, det_by_frame.get(fr["frame_idx"], []),
-                                   min_conf=min_conf)
-        ts_s = fr["timestamp_ms"] / 1000.0
-        cv2.putText(img, f"frame #{fr['frame_idx']}  t={ts_s:.2f}s",
-                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(img, f"frame #{fr['frame_idx']}  t={ts_s:.2f}s",
-                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-        writer.write(img)
-        progress.progress((i + 1) / len(frames))
-    writer.release()
+    out_path = build_annotated_video(
+        frames=frames,
+        det_by_frame=bundle["det_by_frame"],
+        depth_by_frame=bundle["depth_by_frame"],
+        out_base=run_dir / "annotated_strip",
+        fps=fps,
+        show_dets=show_dets,
+        show_depth=show_depth,
+        show_masks=show_masks,
+        min_conf=min_conf,
+        resolve=_resolve,
+        on_progress=progress.progress,
+    )
     progress.empty()
     return out_path
 
@@ -866,17 +815,21 @@ def _render_video_player(run_dir: Path, bundle: dict) -> None:
         st.write("_no frames to encode_")
         return
 
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    masks_available = _has_masks(bundle["det_by_frame"])
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
     fps = c1.slider("Playback FPS", 1.0, 12.0, 4.0, 0.5, key="vid_fps")
     show_dets = c2.checkbox("Detections", value=True, key="vid_dets")
-    show_depth = c3.checkbox("Depth heatmap", value=False, key="vid_depth",
+    show_masks = c3.checkbox("Masks", value=False, key="vid_masks",
+                             disabled=not masks_available)
+    show_depth = c4.checkbox("Depth heatmap", value=False, key="vid_depth",
                              disabled=not bundle["depth_by_frame"])
-    min_conf = c4.slider("Min confidence", 0.0, 1.0, 0.25, 0.05, key="vid_conf")
+    min_conf = c5.slider("Min confidence", 0.0, 1.0, 0.25, 0.05, key="vid_conf")
 
     out_path = run_dir / "annotated_strip.mp4"
     if st.button("Build / rebuild annotated video"):
         result = _build_annotated_video(run_dir, bundle, fps,
-                                        show_dets, show_depth, min_conf)
+                                        show_dets, show_depth, min_conf,
+                                        show_masks=show_masks)
         if result is None:
             st.error("Failed to encode video.")
             return

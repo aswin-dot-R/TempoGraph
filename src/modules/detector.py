@@ -206,6 +206,19 @@ class ObjectDetector:
                 if result.boxes.id is not None:
                     track_ids = result.boxes.id
 
+                # Seg variants attach per-instance masks; encode them to
+                # COCO-style RLE at the saved-frame resolution. `xyn` holds
+                # polygons normalised to the original image, so rasterising
+                # them is alignment-safe regardless of letterbox padding.
+                masks_xyn = None
+                if getattr(result, "masks", None) is not None:
+                    try:
+                        masks_xyn = result.masks.xyn
+                    except Exception as e:
+                        self.logger.warning(
+                            f"could not read masks for frame {frame_idx}: {e}"
+                        )
+
                 for i, box in enumerate(result.boxes):
                     xyxy = box.xyxy[0]
                     if hasattr(xyxy, "cpu"):
@@ -224,6 +237,12 @@ class ObjectDetector:
                         except (TypeError, ValueError):
                             track_id = None
 
+                    mask_rle = None
+                    if masks_xyn is not None and i < len(masks_xyn):
+                        mask_rle = self._encode_mask_rle(
+                            masks_xyn[i], frame_width, frame_height
+                        )
+
                     db.insert_detection(
                         frame_idx=int(frame_idx),
                         track_id=track_id,
@@ -233,6 +252,7 @@ class ObjectDetector:
                         x2=x2 / frame_width,
                         y2=y2 / frame_height,
                         confidence=conf,
+                        mask_rle=mask_rle,
                     )
                     det_count += 1
             except Exception as e:
@@ -254,6 +274,35 @@ class ObjectDetector:
                     "eta_s": round(max(0, eta), 1),
                     "elapsed_s": round(elapsed, 1),
                 })
+
+    def _encode_mask_rle(
+        self, polygon_xyn, frame_width: int, frame_height: int
+    ) -> Optional[str]:
+        """Rasterise one normalised instance polygon and RLE-encode it.
+
+        Returns the JSON string for the ``mask_rle`` column, or None when the
+        polygon is degenerate / rasterisation fails.
+        """
+        try:
+            import cv2
+            import numpy as np
+
+            from src.rle import encode_to_string
+
+            if polygon_xyn is None or len(polygon_xyn) < 3:
+                return None
+            pts = np.round(
+                np.asarray(polygon_xyn, dtype=np.float64)
+                * [frame_width, frame_height]
+            ).astype(np.int32)
+            mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+            cv2.fillPoly(mask, [pts], 1)
+            if not mask.any():
+                return None
+            return encode_to_string(mask)
+        except Exception as e:
+            self.logger.warning(f"mask RLE encode failed: {e}")
+            return None
 
     def _read_frame(self, frame_path: Path) -> Optional[object]:
         """Read frame using OpenCV."""
