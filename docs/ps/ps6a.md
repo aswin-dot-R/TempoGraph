@@ -47,6 +47,24 @@ def search(db_path: Path, query: str, limit: int = 20,
     double quotes/operators; join terms with OR when the raw MATCH errors)."""
 ```
 
+Additionally (implementation-only, NOT part of the frozen contract — the
+parallel test lane does not test it):
+
+```python
+def rewrite_query(query: str, base_url: str = "http://127.0.0.1:8093",
+                  timeout_s: float = 4.0) -> str:
+    """Expand a natural-language query into FTS-friendly search terms via
+    the tiny always-on Gemma E2B server (OpenAI-compatible llama-server).
+    Prompt must start with "/no_think" and ask for ONLY a space-separated
+    term list (originals + synonyms/inflections, max ~12 terms).
+    ANY failure (timeout, connection, empty reply) -> return the original
+    query unchanged. Never raises."""
+```
+
+The Search tab calls `search()` with the rewritten query, falling back to
+the raw query when results are empty. Show the rewritten terms in a small
+caption so the user sees what was searched.
+
 UI contract: a **Search** tab in Results.py. `st.text_input` (key
 `search_query`) + optional source-type selectbox; each hit renders
 `MM:SS · [source_type] · snippet` with two buttons:
