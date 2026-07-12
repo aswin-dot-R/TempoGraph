@@ -29,6 +29,7 @@ States: `spec'd` → `in-progress` → `gate review (Fable)` → `merged`
 | 5 | **Click-to-play** — every timestamp plays the video | `ps5a.md` (impl, 35B) + `ps5b.md` (tests, 9B) | spec'd |
 | 6 | **Natural-language search** — FTS5 over transcript + dense captions + detections + events; show-frame / play-span actions. Depends on 5 (player contract) | `ps6a.md` + `ps6b.md` | spec'd |
 | 7 | **Highlight reel** — top-delta spans → 60s summary clip | `ps7a.md` + `ps7b.md` | spec'd |
+| 7.5 | **UI facelift** — the drop-flow and Results page look stock-Streamlit; needs a visual identity before the demo GIF. Custom theme (.streamlit/config.toml), landing hero, styled stage checklist, consistent tab headers/cards, dark-first palette. PS written by Fable when PS7 merges | — | queued |
 | 8 | **Ship hardening + packaging** — settings/env config, no hardcoded paths, run-dir collisions fixed, requirements fixed, LICENSE (MIT), GIF-first README with comparison table, HARDWARE.md, Dockerfile, CI | `ps8a.md` (hardening, 35B) + `ps8b.md` (tests + collateral, 9B) | spec'd |
 | 9 | **SHIP v1.0** — Fable-led release checklist: full suite + smoke on real footage, README GIF recorded by human, repo scrub (`results/`, `*.pt`, personal paths), squash-review of branch, merge to main, tag v1.0.0, push to public GitHub | (no PS — gate session) | blocked on 5–8 |
 
