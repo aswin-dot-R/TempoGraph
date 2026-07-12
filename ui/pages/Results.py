@@ -120,7 +120,7 @@ def _resolve(path_str: str) -> Path:
 
 # ── summarizer helpers ──────────────────────────────────────────────────
 
-DEFAULT_VLM_URL = "http://127.0.0.1:8082"
+DEFAULT_VLM_URL = "http://127.0.0.1:8085"  # Ornith 1.0 9B (always-on)
 
 
 def _llm_health_probe(url: str = DEFAULT_VLM_URL, timeout: float = 2.0) -> bool:

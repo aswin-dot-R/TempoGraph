@@ -489,8 +489,14 @@ def _render_progress_screen():
                 yolo_size=overrides["yolo_size"],
                 threshold_mult=overrides["threshold_mult"],
                 skip_vlm=overrides["skip_vlm"],
-                vlm_autostart_service="qwen35-turboquant.service",
-                vlm_autostop=not overrides["keep_vlm_running"],
+                # Ornith 1.0 9B (vision) runs permanently on :8085 and also
+                # serves the opencode coder — no autostart, NEVER autostop.
+                # (qwen35-turboquant is retired; its old port 8082 is now the
+                # free-claude-code proxy.)
+                vlm_url="http://127.0.0.1:8085",
+                vlm_model="ornith-1.0-9b-Q4_K_M.gguf",
+                vlm_autostart_service=None,
+                vlm_autostop=False,
                 vlm_frame_mode=overrides["vlm_frame_mode"],
                 vlm_dedup_threshold=overrides["vlm_dedup_threshold"],
                 dynamic_chunking=overrides["dynamic_chunking"],
