@@ -10,7 +10,7 @@ States: `spec'd` → `in-progress` → `pre-review (9B)` → `gate review (Fable
 
 | # | Item | PS file | State |
 |---|---|---|---|
-| 1 | frame_captions schema + WAL + DB helpers | `docs/ps/ps1.md` | spec'd |
+| 1 | frame_captions schema + WAL + DB helpers | `docs/ps/ps1.md` | **merged** (`52e71f5`, 2026-07-12) |
 | 2 | DenseCaptionWalker (9B, per-frame captions + change lines) | `docs/ps/ps2.md` | spec'd |
 | 3 | EscalationVerifier (35B, parallel second opinions) | `docs/ps/ps3.md` | spec'd |
 | 4 | Pipeline stage + Results UI + aggregator pass | `docs/ps/ps4.md` | spec'd |

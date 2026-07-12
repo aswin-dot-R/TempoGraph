@@ -234,3 +234,20 @@ $ /home/ashie/anaconda3/bin/python3 -m pytest -q
 ```
 
 Commits: `b6b0353` (item 1), `a1c92cc` (item 2).
+
+---
+
+## 2026-07-12 — PS1: frame_captions schema + WAL + DB helpers
+
+Executed by Ornith 35B architect (opencode); gate-reviewed by Fable.
+Suite 115 → 121 passed. `frame_captions` table (walker INSERTs, verifier
+UPDATEs), `idx_fc_escalated`, WAL + busy_timeout for the two concurrent
+writers, five helpers (`insert_frame_caption`, `fetch_unverified_escalations`,
+`save_caption_verdict`, `count_frame_captions`, `get_frame_caption`).
+Review fixes by Fable: hoisted datetime import to module level, corrected
+`get_frame_caption` docstring (returns dict), black-formatted.
+
+```
+$ pytest tests/test_dense_schema.py -q  → 6 passed
+$ pytest -q                             → 121 passed
+```

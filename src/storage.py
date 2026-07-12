@@ -1,8 +1,9 @@
 """SQLite-backed storage for TempoGraph v2 pipeline."""
 
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 SCHEMA = """
@@ -67,6 +68,23 @@ CREATE TABLE IF NOT EXISTS ethogram_labels (
 CREATE INDEX IF NOT EXISTS idx_ethogram_frame ON ethogram_labels(frame_idx);
 CREATE INDEX IF NOT EXISTS idx_ethogram_profile ON ethogram_labels(profile_name);
 
+CREATE TABLE IF NOT EXISTS frame_captions (
+    frame_idx INTEGER PRIMARY KEY,
+    caption TEXT NOT NULL,
+    change_line TEXT,
+    walker_model TEXT NOT NULL,
+    escalated INTEGER NOT NULL DEFAULT 0,
+    verifier_caption TEXT,
+    verifier_agrees INTEGER,
+    verifier_model TEXT,
+    created_at TEXT NOT NULL,
+    verified_at TEXT,
+    FOREIGN KEY (frame_idx) REFERENCES frames(frame_idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fc_escalated
+    ON frame_captions(escalated, verifier_agrees);
+
 CREATE TABLE IF NOT EXISTS run_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -79,6 +97,10 @@ class TempoGraphDB:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
+        # Two threads (9B walker, 35B verifier) write this DB concurrently
+        # via separate connections — WAL avoids locked-error stalls.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
         self._migrate()
@@ -91,14 +113,9 @@ class TempoGraphDB:
         added later must be back-filled with ALTER TABLE. NULL means absent
         (e.g. mask_rle is NULL for bbox-only detections).
         """
-        cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(detections)")
-        }
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(detections)")}
         if "mask_rle" not in cols:
-            self._conn.execute(
-                "ALTER TABLE detections ADD COLUMN mask_rle TEXT"
-            )
+            self._conn.execute("ALTER TABLE detections ADD COLUMN mask_rle TEXT")
 
     def has_table(self, name: str) -> bool:
         cur = self._conn.execute(
@@ -151,16 +168,24 @@ class TempoGraphDB:
             "(frame_idx, track_id, class_name, x1, y1, x2, y2, confidence, "
             "mean_depth, mask_rle) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (frame_idx, track_id, class_name, x1, y1, x2, y2, confidence,
-             mean_depth, mask_rle),
+            (
+                frame_idx,
+                track_id,
+                class_name,
+                x1,
+                y1,
+                x2,
+                y2,
+                confidence,
+                mean_depth,
+                mask_rle,
+            ),
         )
         self._conn.commit()
         return cur.lastrowid
 
     def count_detections(self) -> int:
-        return int(
-            self._conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
-        )
+        return int(self._conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0])
 
     def get_detections_for_frame(self, frame_idx: int) -> list:
         rows = self._conn.execute(
@@ -221,10 +246,14 @@ class TempoGraphDB:
     # ── stage tracking (crash-resume) ──────────────────────────────
 
     def mark_stage_complete(
-        self, stage_name: str, elapsed_s: float = 0.0, n_units: int = 0,
+        self,
+        stage_name: str,
+        elapsed_s: float = 0.0,
+        n_units: int = 0,
     ) -> None:
         """Record that a pipeline stage finished successfully."""
         from datetime import datetime
+
         self._conn.execute(
             "INSERT OR REPLACE INTO run_stages "
             "(stage_name, finished_at, elapsed_s, n_units) VALUES (?, ?, ?, ?)",
@@ -249,9 +278,7 @@ class TempoGraphDB:
 
     def get_meta(self, key: str) -> Optional[str]:
         """Read a run_meta value, or None."""
-        cur = self._conn.execute(
-            "SELECT value FROM run_meta WHERE key = ?", (key,)
-        )
+        cur = self._conn.execute("SELECT value FROM run_meta WHERE key = ?", (key,))
         row = cur.fetchone()
         return row["value"] if row else None
 
@@ -312,6 +339,91 @@ class TempoGraphDB:
             "SELECT DISTINCT profile_name FROM ethogram_labels ORDER BY profile_name"
         ).fetchall()
         return [r[0] for r in rows]
+
+    # ── dense temporal captioning ──────────────────────────────────
+
+    def insert_frame_caption(
+        self,
+        frame_idx: int,
+        caption: str,
+        change_line: Optional[str],
+        walker_model: str,
+        escalated: bool = False,
+    ) -> None:
+        """INSERT OR REPLACE one walker row; sets created_at. Commits."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO frame_captions "
+            "(frame_idx, caption, change_line, walker_model, escalated, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                frame_idx,
+                caption,
+                change_line,
+                walker_model,
+                int(escalated),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self._conn.commit()
+
+    def fetch_unverified_escalations(self, limit: int = 8) -> list:
+        """Rows (sqlite3.Row) WHERE escalated=1 AND verifier_agrees IS NULL,
+        ordered by frame_idx, at most `limit`."""
+        rows = self._conn.execute(
+            "SELECT * FROM frame_captions "
+            "WHERE escalated = 1 AND verifier_agrees IS NULL "
+            "ORDER BY frame_idx ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return rows
+
+    def save_caption_verdict(
+        self,
+        frame_idx: int,
+        verifier_caption: str,
+        verifier_agrees: bool,
+        verifier_model: str,
+    ) -> None:
+        """UPDATE the row; sets verified_at. Commits."""
+        self._conn.execute(
+            "UPDATE frame_captions "
+            "SET verifier_caption = ?, verifier_agrees = ?, verifier_model = ?, "
+            "verified_at = ? "
+            "WHERE frame_idx = ?",
+            (
+                verifier_caption,
+                int(verifier_agrees),
+                verifier_model,
+                datetime.now(timezone.utc).isoformat(),
+                frame_idx,
+            ),
+        )
+        self._conn.commit()
+
+    def count_frame_captions(self) -> Tuple[int, int, int]:
+        """(total rows, escalated rows, verified rows)."""
+        total = int(
+            self._conn.execute("SELECT COUNT(*) FROM frame_captions").fetchone()[0]
+        )
+        escalated = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM frame_captions WHERE escalated = 1"
+            ).fetchone()[0]
+        )
+        verified = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM frame_captions WHERE verified_at IS NOT NULL"
+            ).fetchone()[0]
+        )
+        return (total, escalated, verified)
+
+    def get_frame_caption(self, frame_idx: int):
+        """One row as a plain dict, or None if the frame has no caption."""
+        row = self._conn.execute(
+            "SELECT * FROM frame_captions WHERE frame_idx = ?",
+            (frame_idx,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def close(self) -> None:
         self._conn.close()
