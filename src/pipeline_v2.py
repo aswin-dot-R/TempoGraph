@@ -390,29 +390,33 @@ class PipelineV2:
                     )
                 else:
                     t0 = time.time()
-                    counts = run_dense_captioning(
-                        db_path=self.db_path,
-                        walker_url=self.walker_url,
-                        verifier_url=self.verifier_url,
-                        on_progress=lambda info: self._stage(
-                            "Dense captions", "progress", **info
-                        ),
-                        cancel_event=self._cancel_event,
-                    )
-                    captioned = counts.get("walker", {}).get("captioned", 0)
-                    escalated = counts.get("walker", {}).get("escalated", 0)
-                    self._stage(
-                        "Dense captions",
-                        "done",
-                        elapsed_s=round(time.time() - t0, 2),
-                        captioned=captioned,
-                        escalated=escalated,
-                    )
-                    db.mark_stage_complete(
-                        "Dense captions",
-                        elapsed_s=round(time.time() - t0, 2),
-                        n_units=captioned,
-                    )
+                    try:
+                        counts = run_dense_captioning(
+                            db_path=self.db_path,
+                            walker_url=self.walker_url,
+                            verifier_url=self.verifier_url,
+                            on_progress=lambda info: self._stage(
+                                "Dense captions", "progress", **info
+                            ),
+                            cancel_event=self._cancel_event,
+                        )
+                        captioned = counts.get("walker", {}).get("captioned", 0)
+                        escalated = counts.get("walker", {}).get("escalated", 0)
+                        self._stage(
+                            "Dense captions",
+                            "done",
+                            elapsed_s=round(time.time() - t0, 2),
+                            captioned=captioned,
+                            escalated=escalated,
+                        )
+                        db.mark_stage_complete(
+                            "Dense captions",
+                            elapsed_s=round(time.time() - t0, 2),
+                            n_units=captioned,
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Dense captions failed: {e}")
+                        self._stage("Dense captions", "error", error=str(e))
             else:
                 self._stage("Dense captions", "skipped")
 
@@ -428,32 +432,36 @@ class PipelineV2:
                     )
                 else:
                     t0 = time.time()
-                    depth = DepthEstimator(
-                        device=(
-                            "cuda"
-                            if (_TORCH_AVAILABLE and torch.cuda.is_available())
-                            else "cpu"
+                    try:
+                        depth = DepthEstimator(
+                            device=(
+                                "cuda"
+                                if (_TORCH_AVAILABLE and torch.cuda.is_available())
+                                else "cpu"
+                            )
                         )
-                    )
-                    depth.estimate_to_db(
-                        frame_indices=selection["frame_indices"],
-                        frame_paths=frame_paths,
-                        db=db,
-                        output_dir=str(out_dir / "depth"),
-                    )
-                    depth.cleanup()
-                    gc.collect()
-                    if _TORCH_AVAILABLE and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    self._stage(
-                        "Depth estimation",
-                        "done",
-                        elapsed_s=round(time.time() - t0, 2),
-                    )
-                    db.mark_stage_complete(
-                        "Depth estimation",
-                        elapsed_s=round(time.time() - t0, 2),
-                    )
+                        depth.estimate_to_db(
+                            frame_indices=selection["frame_indices"],
+                            frame_paths=frame_paths,
+                            db=db,
+                            output_dir=str(out_dir / "depth"),
+                        )
+                        depth.cleanup()
+                        gc.collect()
+                        if _TORCH_AVAILABLE and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        self._stage(
+                            "Depth estimation",
+                            "done",
+                            elapsed_s=round(time.time() - t0, 2),
+                        )
+                        db.mark_stage_complete(
+                            "Depth estimation",
+                            elapsed_s=round(time.time() - t0, 2),
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Depth estimation failed: {e}")
+                        self._stage("Depth estimation", "error", error=str(e))
             else:
                 self._stage("Depth estimation", "skipped")
 

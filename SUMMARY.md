@@ -314,3 +314,32 @@ $ streamlit headless boot                 → UI_BOOTS
 ```
 
 Dense Temporal Captioning (PS1–PS4) is now complete end-to-end.
+
+---
+
+## 2026-07-12 — HOTFIX 1: real-video drops no longer crash (parallel lanes)
+
+First two-lane parallel execution: Ornith 35B implemented (hotfix1a),
+Ornith 9B wrote the resilience tests (hotfix1b) simultaneously against
+frozen contracts; Fable gate-reviewed and merged. Suite 160 → 166.
+
+Root cause (reproduced): real 1080p video → derive_plan enables depth →
+`from transformers import pipeline` → ModuleNotFoundError kills the run.
+Fix: derive_plan only offers depth when transformers is importable
+(plan gains `notes`, e.g. "depth off: transformers not installed");
+Depth / Dense captions / Audio stage bodies armored — failure emits a
+stage "error" event and the run continues.
+
+Gate-review fix by Fable: 9B's test helper accepted `dense_captions` but
+never forwarded it to PipelineV2, so the dense resilience test asserted
+against a skipped stage (1 failed → fixed → 6/6). 35B legitimately
+stepped outside its fence to update `tests/test_auto_profile.py` (the
+depth assertions are now environment-aware) — fence was wrong, change
+accepted.
+
+```
+$ pytest tests/test_optional_stage_resilience.py -q → 6 passed
+$ pytest -q                                         → 166 passed
+$ python -m src.pipeline_v2 --video file_example... → Done in 4.0s (was: crash)
+$ derive_plan(probe(...)) → depth_enabled: False, notes: ['depth off: transformers not installed']
+```

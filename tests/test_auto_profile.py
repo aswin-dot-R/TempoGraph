@@ -1,5 +1,7 @@
 """Unit tests for src/auto_profile.py."""
 
+import importlib.util
+
 from src.auto_profile import VideoFacts, derive_plan
 
 
@@ -31,12 +33,15 @@ class TestDerivePlanShortClip:
         assert plan.yolo_size == "x"
         assert plan.yolo_seg is True
         assert plan.confidence == 0.5
-        assert plan.depth_enabled is True
+        transformers_available = importlib.util.find_spec("transformers") is not None
+        assert plan.depth_enabled is transformers_available
         assert plan.audio_enabled is True
         assert plan.whisper_model == "base.en"
         assert plan.vlm_frame_mode == "keyframes"
         assert plan.dynamic_chunking is True
         assert plan.vlm_dedup_threshold == 0.92
+        if not transformers_available:
+            assert plan.notes == ["depth off: transformers not installed"]
 
     def test_short_clip_without_audio(self):
         facts = _make_facts(duration_s=120.0, has_audio=False)
@@ -73,7 +78,10 @@ class TestDerivePlanLongVideo:
         assert plan.yolo_seg is True
         assert plan.audio_enabled is True
         assert plan.whisper_model == "base.en"
-        assert plan.depth_enabled is True
+        transformers_available = importlib.util.find_spec("transformers") is not None
+        assert plan.depth_enabled is transformers_available
+        if not transformers_available:
+            assert plan.notes == ["depth off: transformers not installed"]
 
     def test_1hour_silent(self):
         facts = _make_facts(duration_s=3600.0, has_audio=False)
@@ -151,6 +159,7 @@ class TestDerivedPlanToPipelineKwargs:
             "audio_enabled",
             "whisper_model",
             "skip_vlm",
+            "notes",
         }
         assert expected_keys.issubset(set(kwargs.keys()))
 

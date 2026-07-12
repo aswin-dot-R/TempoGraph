@@ -5,9 +5,11 @@ Pure functions — no real video needed for unit tests.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List
 
 
 @dataclass
@@ -36,6 +38,7 @@ class DerivedPlan:
     threshold_mult: float
     camera_mode: str
     skip_vlm: bool = False
+    notes: List[str] = field(default_factory=list)
 
     def to_pipeline_kwargs(self) -> dict:
         """Convert to kwargs suitable for PipelineV2.__init__ (minus config)."""
@@ -55,6 +58,7 @@ class DerivedPlan:
             "audio_enabled": self.audio_enabled,
             "whisper_model": self.whisper_model,
             "skip_vlm": self.skip_vlm,
+            "notes": self.notes,
         }
 
 
@@ -155,6 +159,10 @@ def derive_plan(facts: VideoFacts) -> DerivedPlan:
 
     # Depth
     depth_enabled = True
+    notes: List[str] = []
+    if depth_enabled and importlib.util.find_spec("transformers") is None:
+        depth_enabled = False
+        notes.append("depth off: transformers not installed")
 
     # VLM
     vlm_frame_mode = "keyframes"
@@ -186,4 +194,5 @@ def derive_plan(facts: VideoFacts) -> DerivedPlan:
         vlm_dedup_threshold=vlm_dedup_threshold,
         threshold_mult=threshold_mult,
         camera_mode=camera_mode,
+        notes=notes,
     )
