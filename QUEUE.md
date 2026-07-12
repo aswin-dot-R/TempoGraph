@@ -13,7 +13,7 @@ States: `spec'd` → `in-progress` → `pre-review (9B)` → `gate review (Fable
 | 1 | frame_captions schema + WAL + DB helpers | `docs/ps/ps1.md` | **merged** (`52e71f5`, 2026-07-12) |
 | 2 | DenseCaptionWalker (9B, per-frame captions + change lines) | `docs/ps/ps2.md` | **merged** (2026-07-12) |
 | 3 | EscalationVerifier (35B, parallel second opinions) | `docs/ps/ps3.md` | **merged** (2026-07-12) |
-| 4 | Pipeline stage + Results UI + aggregator pass | `docs/ps/ps4.md` | in-progress (35B) |
+| 4 | Pipeline stage + Results UI + aggregator pass | `docs/ps/ps4.md` | **merged** (2026-07-12) |
 | 5a | Click-to-play IMPLEMENTATION (35B lane) | `docs/ps/ps5a.md` | spec'd — run in parallel with 5b |
 | 5b | Click-to-play TEST SUITE (9B lane) | `docs/ps/ps5b.md` | spec'd — run in parallel with 5a |
 | 6 | NL search — FTS5 over transcript + dense captions + detections + events, Ornith-assisted semantic layer, show-frame / play-span result actions | — | queued |

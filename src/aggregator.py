@@ -1,6 +1,8 @@
 """Aggregates per-chunk captions into an AnalysisResult."""
 
 import logging
+import sqlite3
+from pathlib import Path
 from typing import List, Optional
 
 import requests
@@ -58,23 +60,137 @@ class CaptionAggregator:
         self.parser = JSONParser()
         self.logger = logging.getLogger(__name__)
 
-    def aggregate(self, chunks: List[ChunkCaption],
-                  transcript_segments: Optional[list] = None,
-                  on_call: Optional[callable] = None) -> AnalysisResult:
+    def aggregate(
+        self,
+        chunks: List[ChunkCaption],
+        transcript_segments: Optional[list] = None,
+        on_call: Optional[callable] = None,
+        db_path: Optional[Path] = None,
+    ) -> AnalysisResult:
         if not chunks:
             return AnalysisResult(summary="No captions produced.")
 
         self._on_call = on_call
         transcript_text = self._format_transcript(transcript_segments or [])
 
+        # Dense timeline (optional context from dense captioning stage).
+        dense_text = ""
+        dense_timeline: List[dict] = []
+        if db_path is not None:
+            try:
+                dense_timeline = self.load_dense_timeline(db_path)
+            except Exception as e:
+                self.logger.warning(f"could not load dense timeline: {e}")
+            if dense_timeline:
+                dense_text = self._format_dense_timeline(dense_timeline)
+
         if len(chunks) <= self.single_pass_max_chunks:
-            return self._single_pass(chunks, transcript_text)
+            result = self._single_pass(chunks, transcript_text, dense_text=dense_text)
+        else:
+            meta = self._compress_hierarchical(chunks)
+            result = self._single_pass_from_text(
+                meta, transcript_text, dense_text=dense_text
+            )
 
-        meta = self._compress_hierarchical(chunks)
-        return self._single_pass_from_text(meta, transcript_text)
+        if dense_timeline:
+            object.__setattr__(result, "dense_timeline", dense_timeline)
+        return result
 
-    def _single_pass(self, chunks: List[ChunkCaption],
-                     transcript_text: str = "") -> AnalysisResult:
+    def load_dense_timeline(self, db_path: Path, max_lines: int = 120) -> list:
+        """Condensed dense-caption timeline for aggregation and analysis.json.
+
+        Reads frame_captions joined with frames (for timestamp_ms). Keeps every
+        escalated row (verifier_caption preferred over caption when
+        verifier_agrees == 0) and evenly subsamples the rest so the total is
+        <= max_lines. Returns [{"timestamp_ms": int, "text": str,
+        "escalated": bool, "verified": bool}] sorted by timestamp.
+        """
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT fc.frame_idx, fc.caption, fc.verifier_caption, "
+                "fc.verifier_agrees, fc.escalated, f.timestamp_ms "
+                "FROM frame_captions fc "
+                "JOIN frames f ON fc.frame_idx = f.frame_idx "
+                "ORDER BY f.timestamp_ms ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return []
+
+        escalated: List[dict] = []
+        regular: List[dict] = []
+
+        for r in rows:
+            # verifier_agrees == 0 means the 35B disagreed → use its caption.
+            if (
+                r["verifier_caption"] is not None
+                and r["verifier_agrees"] is not None
+                and r["verifier_agrees"] == 0
+            ):
+                text = r["verifier_caption"]
+            else:
+                text = r["caption"]
+            item = {
+                "timestamp_ms": int(r["timestamp_ms"]),
+                "text": text,
+                "escalated": bool(r["escalated"]),
+                "verified": r["verifier_agrees"] is not None,
+            }
+            if item["escalated"]:
+                escalated.append(item)
+            else:
+                regular.append(item)
+
+        total = len(escalated) + len(regular)
+        if total <= max_lines:
+            return escalated + regular
+
+        # Subsample regular rows to fit.
+        remaining = max_lines - len(escalated)
+        if remaining <= 0:
+            return escalated
+
+        if len(regular) <= remaining:
+            subsampled = regular
+        else:
+            step = len(regular) / remaining
+            indices = [
+                min(int(round(i * step)), len(regular) - 1) for i in range(remaining)
+            ]
+            subsampled = [regular[i] for i in indices]
+
+        result = escalated + subsampled
+        result.sort(key=lambda x: x["timestamp_ms"])
+        return result
+
+    @staticmethod
+    def _format_dense_timeline(timeline: list) -> str:
+        """Compact MM:SS text block for prepending to the LLM prompt.
+
+        Escalated lines are prefixed with ``*`` so the LLM can spot them.
+        """
+        if not timeline:
+            return ""
+        lines = []
+        for entry in timeline:
+            ms = entry["timestamp_ms"]
+            mm = ms // 60000
+            ss = (ms % 60000) / 1000.0
+            prefix = "*" if entry.get("escalated") else ""
+            lines.append(f"{prefix}{mm:02d}:{ss:05.2f} {entry['text']}")
+        return "\n".join(lines)
+
+    def _single_pass(
+        self,
+        chunks: List[ChunkCaption],
+        transcript_text: str = "",
+        dense_text: str = "",
+    ) -> AnalysisResult:
+        # dense_text is prepended once by _single_pass_from_text below.
         log_lines = []
         for c in chunks:
             for fidx in c.frame_indices:
@@ -83,10 +199,15 @@ class CaptionAggregator:
                     log_lines.append(f"[frame {fidx}] {line}")
             if c.summary:
                 log_lines.append(f"[chunk {c.chunk_id} summary] {c.summary}")
-        return self._single_pass_from_text("\n".join(log_lines), transcript_text)
+        return self._single_pass_from_text(
+            "\n".join(log_lines), transcript_text, dense_text=dense_text
+        )
 
-    def _single_pass_from_text(self, captions_text: str,
-                               transcript_text: str = "") -> AnalysisResult:
+    def _single_pass_from_text(
+        self, captions_text: str, transcript_text: str = "", dense_text: str = ""
+    ) -> AnalysisResult:
+        if dense_text:
+            captions_text = f"[dense captions]\n{dense_text}\n\n{captions_text}"
         prompt = SINGLE_PASS_PROMPT.format(
             captions=captions_text,
             transcript=transcript_text or "(no transcript)",
@@ -109,9 +230,7 @@ class CaptionAggregator:
             ss = (start_ms % 60000) / 1000.0
             mm2 = end_ms // 60000
             ss2 = (end_ms % 60000) / 1000.0
-            lines.append(
-                f"[{mm:02d}:{ss:05.2f}-{mm2:02d}:{ss2:05.2f}] {text}"
-            )
+            lines.append(f"[{mm:02d}:{ss:05.2f}-{mm2:02d}:{ss2:05.2f}] {text}")
         return "\n".join(lines)
 
     def _compress_hierarchical(self, chunks: List[ChunkCaption]) -> str:
@@ -150,11 +269,13 @@ class CaptionAggregator:
             cb = getattr(self, "_on_call", None)
             if cb is not None:
                 try:
-                    cb({
-                        "prompt_tokens": int(usage.get("prompt_tokens", 0)),
-                        "completion_tokens": int(usage.get("completion_tokens", 0)),
-                        "total_tokens": int(usage.get("total_tokens", 0)),
-                    })
+                    cb(
+                        {
+                            "prompt_tokens": int(usage.get("prompt_tokens", 0)),
+                            "completion_tokens": int(usage.get("completion_tokens", 0)),
+                            "total_tokens": int(usage.get("total_tokens", 0)),
+                        }
+                    )
                 except Exception:
                     pass
             choices = data.get("choices") or []

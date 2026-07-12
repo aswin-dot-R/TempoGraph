@@ -289,3 +289,28 @@ per-poll info logs downgraded to debug; black-formatted.
 $ pytest tests/test_dense_verifier.py -q  → 11 passed
 $ pytest -q                               → 153 passed
 ```
+
+---
+
+## 2026-07-12 — PS4: dense captioning wired into pipeline, UI, aggregation
+
+Executed by Ornith 35B architect (opencode); gate-reviewed by Fable.
+Suite 153 → 160 passed (7 new). Pipeline gains the opt-in "Dense captions"
+stage (after YOLO, resume-guarded, cancel-aware, progress-forwarded);
+`CaptionAggregator.load_dense_timeline()` (escalated rows kept, verifier
+caption preferred on disagreement, even subsampling to ≤120 lines) feeds
+a `[dense captions]` block into the aggregation prompt and a
+`dense_timeline` key into analysis.json; frame inspector shows walker
+caption + change line + 35B second opinion (✅/⚠️); Timeline gains a dense
+caption section. Gate-review fix by Fable: the dense block was prepended
+to the LLM prompt TWICE in the `_single_pass` path (once into log_lines,
+once by `_single_pass_from_text`) — now prepended exactly once.
+black-formatted all four files.
+
+```
+$ pytest tests/test_dense_pipeline.py -q  → 7 passed
+$ pytest -q                               → 160 passed
+$ streamlit headless boot                 → UI_BOOTS
+```
+
+Dense Temporal Captioning (PS1–PS4) is now complete end-to-end.

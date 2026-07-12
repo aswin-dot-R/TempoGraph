@@ -13,6 +13,7 @@ import cv2
 
 try:
     import torch
+
     _TORCH_AVAILABLE = True
 except ImportError:
     torch = None  # type: ignore[assignment]
@@ -29,6 +30,7 @@ from src.models import (
 )
 from src.modules.depth import DepthEstimator
 from src.modules.detector import ObjectDetector
+from src.modules.dense_captioner import run_dense_captioning
 from src.modules.frame_scorer import FrameScorer
 from src.modules.frame_selector import FrameSelector
 from src.modules.whisper_cpp import (
@@ -61,12 +63,17 @@ class PipelineV2:
         vlm_autostop: bool = False,
         vlm_frame_mode: str = "scored",
         vlm_dedup_threshold: float = 0.92,
+        dense_captions: bool = False,
+        walker_url: str = "http://127.0.0.1:8085",
+        verifier_url: str = "http://127.0.0.1:8096",
         dynamic_chunking: bool = True,
         context_threshold: float = 0.80,
         audio_enabled: bool = False,
         whisper_model: str = "base.en",
         whisper_binary: Optional[str] = None,
-        whisper_gpu_device: Optional[int] = 1,  # Vulkan dev 1 = NVIDIA 3060 (radv on AMD has device-lost issues)
+        whisper_gpu_device: Optional[
+            int
+        ] = 1,  # Vulkan dev 1 = NVIDIA 3060 (radv on AMD has device-lost issues)
         whisper_language: Optional[str] = None,
         on_stage: Optional[Callable[[str, str, dict], None]] = None,
         cancel_event: Optional[threading.Event] = None,
@@ -79,9 +86,7 @@ class PipelineV2:
         self.depth_enabled = depth_enabled
         self.use_segmentation = use_segmentation
         if yolo_size not in ("n", "s", "m", "l", "x"):
-            raise ValueError(
-                f"yolo_size must be one of n/s/m/l/x, got {yolo_size!r}"
-            )
+            raise ValueError(f"yolo_size must be one of n/s/m/l/x, got {yolo_size!r}")
         self.yolo_size = yolo_size
         self.threshold_mult = threshold_mult
         self.jpeg_quality = jpeg_quality
@@ -98,6 +103,9 @@ class PipelineV2:
             )
         self.vlm_frame_mode = vlm_frame_mode
         self.vlm_dedup_threshold = vlm_dedup_threshold
+        self.dense_captions = dense_captions
+        self.walker_url = walker_url
+        self.verifier_url = verifier_url
         self.dynamic_chunking = dynamic_chunking
         self.context_threshold = context_threshold
         self.audio_enabled = audio_enabled
@@ -126,7 +134,8 @@ class PipelineV2:
             return
         if not self.vlm_autostart_service:
             self._stage(
-                "VLM captioning", "error",
+                "VLM captioning",
+                "error",
                 error=f"llama-server not reachable at {self.vlm_url}",
             )
             raise RuntimeError(
@@ -134,17 +143,21 @@ class PipelineV2:
                 "Start it with: systemctl --user start qwen35-turboquant.service"
             )
 
-        self._stage(
-            "VLM autostart", "start", service=self.vlm_autostart_service
-        )
+        self._stage("VLM autostart", "start", service=self.vlm_autostart_service)
         t0 = time.time()
         try:
             subprocess.run(
                 ["systemctl", "--user", "start", self.vlm_autostart_service],
-                check=True, capture_output=True, text=True, timeout=10,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-                FileNotFoundError) as e:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+        ) as e:
             self._stage("VLM autostart", "error", error=str(e))
             raise RuntimeError(
                 f"Failed to start {self.vlm_autostart_service}: {e}"
@@ -154,14 +167,16 @@ class PipelineV2:
         while time.time() < deadline:
             if backend.is_available():
                 self._stage(
-                    "VLM autostart", "done",
+                    "VLM autostart",
+                    "done",
                     elapsed_s=round(time.time() - t0, 2),
                 )
                 return
             time.sleep(1.0)
 
         self._stage(
-            "VLM autostart", "error",
+            "VLM autostart",
+            "error",
             error=f"timeout after {self.vlm_autostart_timeout_s}s",
         )
         raise RuntimeError(
@@ -175,6 +190,7 @@ class PipelineV2:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         db = TempoGraphDB(out_dir / "tempograph.db")
+        self.db_path = out_dir / "tempograph.db"
         try:
             # Remember the source video so post-hoc tools (e.g. clip
             # export) can find it without user input.
@@ -234,7 +250,8 @@ class PipelineV2:
                         delta_score=self._delta_for_index(raw_selection, idx),
                     )
                 self._stage(
-                    "Frame selection", "done",
+                    "Frame selection",
+                    "done",
                     elapsed_s=round(time.time() - t0, 2),
                     frames=len(raw_selection.frame_indices),
                     keyframes=len(raw_selection.keyframe_indices),
@@ -255,35 +272,38 @@ class PipelineV2:
 
             # ── Stage 1.5: Audio transcription (optional) ───────────────
             if self.audio_enabled:
-                self._stage("Audio transcription", "start",
-                            model=self.whisper_model,
-                            gpu_device=self.whisper_gpu_device)
+                self._stage(
+                    "Audio transcription",
+                    "start",
+                    model=self.whisper_model,
+                    gpu_device=self.whisper_gpu_device,
+                )
                 if db.is_stage_complete("Audio transcription"):
-                    self.logger.info(
-                        "Skipping completed stage: Audio transcription"
-                    )
+                    self.logger.info("Skipping completed stage: Audio transcription")
                     self._stage(
-                        "Audio transcription", "skipped",
+                        "Audio transcription",
+                        "skipped",
                         reason="resumed from DB",
                     )
                 else:
                     t0 = time.time()
                     try:
-                        binary = self.whisper_binary or \
-                            "/home/ashie/whisper.cpp/build/bin/whisper-cli"
+                        binary = (
+                            self.whisper_binary
+                            or "/home/ashie/whisper.cpp/build/bin/whisper-cli"
+                        )
                         transcriber = WhisperCppTranscriber(
                             binary=binary,
                             model=self.whisper_model,
                             gpu_device=self.whisper_gpu_device,
                             language=self.whisper_language,
                         )
-                        segments = transcriber.transcribe_video(
-                            self.config.video_path
-                        )
+                        segments = transcriber.transcribe_video(self.config.video_path)
                         write_segments_to_db(db, segments)
                         write_transcript_json(out_dir, segments)
                         self._stage(
-                            "Audio transcription", "done",
+                            "Audio transcription",
+                            "done",
                             elapsed_s=round(time.time() - t0, 2),
                             segments=len(segments),
                             chars=sum(len(s.text) for s in segments),
@@ -294,38 +314,40 @@ class PipelineV2:
                             n_units=len(segments),
                         )
                     except Exception as e:
-                        self.logger.warning(
-                            f"Audio transcription failed: {e}"
-                        )
-                        self._stage(
-                            "Audio transcription", "error", error=str(e)
-                        )
+                        self.logger.warning(f"Audio transcription failed: {e}")
+                        self._stage("Audio transcription", "error", error=str(e))
             else:
                 self._stage("Audio transcription", "skipped")
 
             # ── Stage 2: YOLO sweep ─────────────────────────────────────
             self._stage(
-                "YOLO detection", "start",
-                model=(f"yolo26{self.yolo_size}-seg.pt" if self.use_segmentation
-                       else f"yolo26{self.yolo_size}.pt"),
+                "YOLO detection",
+                "start",
+                model=(
+                    f"yolo26{self.yolo_size}-seg.pt"
+                    if self.use_segmentation
+                    else f"yolo26{self.yolo_size}.pt"
+                ),
                 frames=len(frame_paths),
             )
             if db.is_stage_complete("YOLO detection"):
                 self.logger.info("Skipping completed stage: YOLO detection")
-                self._stage(
-                    "YOLO detection", "skipped", reason="resumed from DB"
-                )
+                self._stage("YOLO detection", "skipped", reason="resumed from DB")
             else:
                 t0 = time.time()
-                model_path = (f"yolo26{self.yolo_size}-seg.pt"
-                              if self.use_segmentation
-                              else f"yolo26{self.yolo_size}.pt")
+                model_path = (
+                    f"yolo26{self.yolo_size}-seg.pt"
+                    if self.use_segmentation
+                    else f"yolo26{self.yolo_size}.pt"
+                )
                 detector = ObjectDetector(
                     model_path=model_path,
                     confidence=self.config.confidence,
-                    device=("cuda" if (_TORCH_AVAILABLE
-                                       and torch.cuda.is_available())
-                            else "cpu"),
+                    device=(
+                        "cuda"
+                        if (_TORCH_AVAILABLE and torch.cuda.is_available())
+                        else "cpu"
+                    ),
                 )
 
                 def _yolo_progress(info: dict) -> None:
@@ -345,7 +367,8 @@ class PipelineV2:
                     torch.cuda.empty_cache()
                 det_count = db.count_detections()
                 self._stage(
-                    "YOLO detection", "done",
+                    "YOLO detection",
+                    "done",
                     elapsed_s=round(time.time() - t0, 2),
                     detections=det_count,
                 )
@@ -355,24 +378,62 @@ class PipelineV2:
                     n_units=det_count,
                 )
 
+            # ── Stage 2.5: Dense captions (optional) ────────────────────
+            if self.dense_captions:
+                self._stage("Dense captions", "start")
+                if db.is_stage_complete("Dense captions"):
+                    self.logger.info("Skipping completed stage: Dense captions")
+                    self._stage(
+                        "Dense captions",
+                        "skipped",
+                        reason="resumed from DB",
+                    )
+                else:
+                    t0 = time.time()
+                    counts = run_dense_captioning(
+                        db_path=self.db_path,
+                        walker_url=self.walker_url,
+                        verifier_url=self.verifier_url,
+                        on_progress=lambda info: self._stage(
+                            "Dense captions", "progress", **info
+                        ),
+                        cancel_event=self._cancel_event,
+                    )
+                    captioned = counts.get("walker", {}).get("captioned", 0)
+                    escalated = counts.get("walker", {}).get("escalated", 0)
+                    self._stage(
+                        "Dense captions",
+                        "done",
+                        elapsed_s=round(time.time() - t0, 2),
+                        captioned=captioned,
+                        escalated=escalated,
+                    )
+                    db.mark_stage_complete(
+                        "Dense captions",
+                        elapsed_s=round(time.time() - t0, 2),
+                        n_units=captioned,
+                    )
+            else:
+                self._stage("Dense captions", "skipped")
+
             # ── Stage 3: Depth estimation (optional) ────────────────────
             if self.depth_enabled:
-                self._stage("Depth estimation", "start",
-                            frames=len(frame_paths))
+                self._stage("Depth estimation", "start", frames=len(frame_paths))
                 if db.is_stage_complete("Depth estimation"):
-                    self.logger.info(
-                        "Skipping completed stage: Depth estimation"
-                    )
+                    self.logger.info("Skipping completed stage: Depth estimation")
                     self._stage(
-                        "Depth estimation", "skipped",
+                        "Depth estimation",
+                        "skipped",
                         reason="resumed from DB",
                     )
                 else:
                     t0 = time.time()
                     depth = DepthEstimator(
-                        device=("cuda" if (_TORCH_AVAILABLE
-                                           and torch.cuda.is_available())
-                                else "cpu")
+                        device=(
+                            "cuda"
+                            if (_TORCH_AVAILABLE and torch.cuda.is_available())
+                            else "cpu"
+                        )
                     )
                     depth.estimate_to_db(
                         frame_indices=selection["frame_indices"],
@@ -385,7 +446,8 @@ class PipelineV2:
                     if _TORCH_AVAILABLE and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     self._stage(
-                        "Depth estimation", "done",
+                        "Depth estimation",
+                        "done",
                         elapsed_s=round(time.time() - t0, 2),
                     )
                     db.mark_stage_complete(
@@ -399,12 +461,11 @@ class PipelineV2:
             self._stage("Frame scoring", "start", mode=self.vlm_frame_mode)
             if db.is_stage_complete("Frame scoring"):
                 self.logger.info("Skipping completed stage: Frame scoring")
-                self._stage(
-                    "Frame scoring", "skipped", reason="resumed from DB"
-                )
+                self._stage("Frame scoring", "skipped", reason="resumed from DB")
                 vlm_frames = self._load_vlm_frames(db)
                 self._stage(
-                    "Frame scoring", "skipped_info",
+                    "Frame scoring",
+                    "skipped_info",
                     vlm_frames=len(vlm_frames),
                 )
             else:
@@ -423,7 +484,8 @@ class PipelineV2:
                         vlm_frames = list(selection["frame_indices"])
                         fallback_used = True
                     self._stage(
-                        "Frame scoring", "done",
+                        "Frame scoring",
+                        "done",
                         elapsed_s=round(time.time() - t0, 2),
                         mode="keyframes",
                         vlm_frames=len(vlm_frames),
@@ -441,7 +503,8 @@ class PipelineV2:
                         k=k,
                     )
                     self._stage(
-                        "Frame scoring", "done",
+                        "Frame scoring",
+                        "done",
                         elapsed_s=round(time.time() - t0, 2),
                         mode="scored",
                         vlm_frames=len(vlm_frames),
@@ -454,9 +517,11 @@ class PipelineV2:
                 )
 
             # ── Stage 4.5: VLM dedup ────────────────────────────────────
-            if (self.vlm_dedup_threshold > 0
-                    and len(vlm_frames) > 1
-                    and not db.is_stage_complete("VLM dedup")):
+            if (
+                self.vlm_dedup_threshold > 0
+                and len(vlm_frames) > 1
+                and not db.is_stage_complete("VLM dedup")
+            ):
                 t0 = time.time()
                 pre_dedup = len(vlm_frames)
                 vlm_frames = self._deduplicate_vlm_frames(
@@ -473,7 +538,8 @@ class PipelineV2:
                         f"threshold={self.vlm_dedup_threshold})"
                     )
                     self._stage(
-                        "VLM dedup", "done",
+                        "VLM dedup",
+                        "done",
                         before=pre_dedup,
                         after=len(vlm_frames),
                         dropped=dropped,
@@ -484,9 +550,11 @@ class PipelineV2:
                     elapsed_s=round(time.time() - t0, 2),
                     n_units=len(vlm_frames),
                 )
-            elif (self.vlm_dedup_threshold > 0
-                  and len(vlm_frames) > 1
-                  and db.is_stage_complete("VLM dedup")):
+            elif (
+                self.vlm_dedup_threshold > 0
+                and len(vlm_frames) > 1
+                and db.is_stage_complete("VLM dedup")
+            ):
                 vlm_frames = self._load_vlm_frames(db)
                 self.logger.info(
                     "VLM dedup: loaded %d frames from resume",
@@ -494,12 +562,8 @@ class PipelineV2:
                 )
 
             if self.skip_vlm:
-                self._stage(
-                    "VLM captioning", "skipped", reason="skip_vlm flag"
-                )
-                self._stage(
-                    "Aggregation", "skipped", reason="skip_vlm flag"
-                )
+                self._stage("VLM captioning", "skipped", reason="skip_vlm flag")
+                self._stage("Aggregation", "skipped", reason="skip_vlm flag")
                 self.logger.info(
                     "Skipping VLM stages (skip_vlm=True). "
                     "Stopped after frame scoring."
@@ -516,19 +580,16 @@ class PipelineV2:
 
             # ── Stage 5: Chunked VLM captioning ─────────────────────────
             self._stage(
-                "VLM captioning", "start",
+                "VLM captioning",
+                "start",
                 vlm_url=self.vlm_url,
                 vlm_model=self.vlm_model,
                 dynamic_chunking=self.dynamic_chunking,
                 context_threshold=self.context_threshold,
             )
             if db.is_stage_complete("VLM captioning"):
-                self.logger.info(
-                    "Skipping completed stage: VLM captioning"
-                )
-                self._stage(
-                    "VLM captioning", "skipped", reason="resumed from DB"
-                )
+                self.logger.info("Skipping completed stage: VLM captioning")
+                self._stage("VLM captioning", "skipped", reason="resumed from DB")
             else:
                 t0 = time.time()
                 backend = LlamaServerBackend(
@@ -551,10 +612,12 @@ class PipelineV2:
                     chunks: List[Tuple[int, List[int]]] = []
                     for i in range(0, len(vlm_frames), self.chunk_size):
                         chunks.append(
-                            (len(chunks), vlm_frames[i: i + self.chunk_size])
+                            (len(chunks), vlm_frames[i : i + self.chunk_size])
                         )
                     chunk_caps = backend.caption_chunks(
-                        chunks=chunks, db=db, on_chunk=_chunk_cb,
+                        chunks=chunks,
+                        db=db,
+                        on_chunk=_chunk_cb,
                     )
                 try:
                     with open(out_dir / "chunks.json", "w") as f:
@@ -562,12 +625,9 @@ class PipelineV2:
                             [
                                 {
                                     "chunk_id": c.chunk_id,
-                                    "frame_indices": list(
-                                        c.frame_indices
-                                    ),
+                                    "frame_indices": list(c.frame_indices),
                                     "per_frame_lines": {
-                                        str(k): v
-                                        for k, v in c.per_frame_lines.items()
+                                        str(k): v for k, v in c.per_frame_lines.items()
                                     },
                                     "summary": c.summary,
                                     "raw_response": c.raw_response,
@@ -580,10 +640,10 @@ class PipelineV2:
                 except Exception as e:
                     self.logger.warning(f"failed to write chunks.json: {e}")
                 self._stage(
-                    "VLM captioning", "done",
+                    "VLM captioning",
+                    "done",
                     elapsed_s=round(time.time() - t0, 2),
-                    non_empty_chunks=sum(1 for c in chunk_caps
-                                         if c.summary),
+                    non_empty_chunks=sum(1 for c in chunk_caps if c.summary),
                 )
                 db.mark_stage_complete(
                     "VLM captioning",
@@ -594,12 +654,8 @@ class PipelineV2:
             # ── Stage 6: Aggregation ────────────────────────────────────
             self._stage("Aggregation", "start")
             if db.is_stage_complete("Aggregation"):
-                self.logger.info(
-                    "Skipping completed stage: Aggregation"
-                )
-                self._stage(
-                    "Aggregation", "skipped", reason="resumed from DB"
-                )
+                self.logger.info("Skipping completed stage: Aggregation")
+                self._stage("Aggregation", "skipped", reason="resumed from DB")
             else:
                 t0 = time.time()
                 transcript_segments = (
@@ -615,9 +671,11 @@ class PipelineV2:
                     chunk_caps,
                     transcript_segments=transcript_segments,
                     on_call=_agg_cb,
+                    db_path=self.db_path,
                 )
                 self._stage(
-                    "Aggregation", "done",
+                    "Aggregation",
+                    "done",
                     elapsed_s=round(time.time() - t0, 2),
                     entities=len(analysis.entities),
                     events=len(analysis.visual_events),
@@ -635,8 +693,12 @@ class PipelineV2:
                     graph.to_pyvis_html(str(out_dir / "graph.html"))
                 except Exception as e:
                     self.logger.warning(f"graph html failed: {e}")
+                # Post-process to include dense_timeline if present
+                _dump = analysis.model_dump()
+                if hasattr(analysis, "dense_timeline"):
+                    _dump["dense_timeline"] = analysis.dense_timeline  # type: ignore[attr-defined]
                 with open(out_dir / "analysis.json", "w") as f:
-                    f.write(analysis.model_dump_json(indent=2))
+                    json.dump(_dump, f, indent=2)
 
                 elapsed = time.time() - start
                 return PipelineResult(
@@ -653,21 +715,19 @@ class PipelineV2:
             if analysis_path.exists():
                 try:
                     import json as _json
+
                     analysis = _json.loads(analysis_path.read_text())
                     elapsed = time.time() - start
                     return PipelineResult(
                         analysis=type(
-                            'AnalysisResult', (),
+                            "AnalysisResult",
+                            (),
                             {
-                                'entities': analysis.get('entities', []),
-                                'visual_events': analysis.get(
-                                    'visual_events', []
-                                ),
-                                'audio_events': analysis.get(
-                                    'audio_events', []
-                                ),
-                                'summary': analysis.get('summary', ''),
-                            }
+                                "entities": analysis.get("entities", []),
+                                "visual_events": analysis.get("visual_events", []),
+                                "audio_events": analysis.get("audio_events", []),
+                                "summary": analysis.get("summary", ""),
+                            },
                         )(),
                         detection=None,
                         depth=None,
@@ -698,11 +758,17 @@ class PipelineV2:
         try:
             subprocess.run(
                 ["systemctl", "--user", "stop", self.vlm_autostart_service],
-                check=True, capture_output=True, text=True, timeout=15,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             self._stage("VLM autostop", "done")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-                FileNotFoundError) as e:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+        ) as e:
             self.logger.warning(f"failed to stop {self.vlm_autostart_service}: {e}")
             self._stage("VLM autostop", "error", error=str(e))
 
@@ -737,11 +803,13 @@ class PipelineV2:
     def _save_vlm_frames(self, db: TempoGraphDB, vlm_frames: List[int]) -> None:
         """Persist vlm_frames for resume."""
         import json
+
         db.set_meta("vlm_frames", json.dumps(vlm_frames))
 
     def _load_vlm_frames(self, db: TempoGraphDB) -> List[int]:
         """Load vlm_frames from DB for resume."""
         import json
+
         raw = db.get_meta("vlm_frames")
         if raw is None:
             return []
@@ -832,7 +900,8 @@ class PipelineV2:
         t0 = time.time()
 
         self._stage(
-            "Frame export", "start",
+            "Frame export",
+            "start",
             frames=total,
             scale=f"{scale:.2f}" if scale < 1.0 else "1.0",
         )
@@ -855,7 +924,9 @@ class PipelineV2:
                     new_h = int(frame.shape[0] * scale)
                     frame = cv2.resize(frame, (new_w, new_h))
                 p = out_dir / f"frame_{frame_num:06d}.jpg"
-                cv2.imwrite(str(p), frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+                cv2.imwrite(
+                    str(p), frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+                )
                 saved[frame_num] = p
 
                 step = len(saved)
@@ -863,10 +934,14 @@ class PipelineV2:
                     elapsed = time.time() - t0
                     fps = step / max(elapsed, 0.01)
                     eta = (total - step) / max(fps, 0.1)
-                    self._stage("Frame export", "progress",
-                                step=step, total=total,
-                                fps=round(fps, 1),
-                                eta_s=round(max(0, eta), 1))
+                    self._stage(
+                        "Frame export",
+                        "progress",
+                        step=step,
+                        total=total,
+                        fps=round(fps, 1),
+                        eta_s=round(max(0, eta), 1),
+                    )
             frame_num += 1
 
         cap.release()
@@ -875,7 +950,8 @@ class PipelineV2:
         paths = [saved[idx] for idx in indices if idx in saved]
 
         self._stage(
-            "Frame export", "done",
+            "Frame export",
+            "done",
             elapsed_s=round(time.time() - t0, 2),
             saved=len(paths),
         )
@@ -888,19 +964,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TempoGraph v2 pipeline")
     parser.add_argument("--video", required=True)
     parser.add_argument("--output", default="results/v2_run")
-    parser.add_argument("--camera", default="static",
-                        choices=["static", "moving", "auto"])
+    parser.add_argument(
+        "--camera", default="static", choices=["static", "moving", "auto"]
+    )
     parser.add_argument("--yolo-fps", type=float, default=1.0)
     parser.add_argument("--vlm-fps", type=float, default=0.5)
     parser.add_argument("--chunk-size", type=int, default=10)
     parser.add_argument("--depth", action="store_true")
-    parser.add_argument("--seg", action="store_true",
-                        help="Use the seg variant (yolo26<size>-seg.pt) "
-                             "instead of the bbox-only model.")
-    parser.add_argument("--yolo-size", choices=["n", "s", "m", "l", "x"],
-                        default="n",
-                        help="YOLO26 model size: n (nano, fastest) → x (xlarge, "
-                             "most accurate). Larger = more VRAM and slower.")
+    parser.add_argument(
+        "--seg",
+        action="store_true",
+        help="Use the seg variant (yolo26<size>-seg.pt) "
+        "instead of the bbox-only model.",
+    )
+    parser.add_argument(
+        "--yolo-size",
+        choices=["n", "s", "m", "l", "x"],
+        default="n",
+        help="YOLO26 model size: n (nano, fastest) → x (xlarge, "
+        "most accurate). Larger = more VRAM and slower.",
+    )
     parser.add_argument("--skip-vlm", action="store_true")
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--threshold-mult", type=float, default=1.0)
@@ -910,7 +993,7 @@ if __name__ == "__main__":
         "--vlm-autostart-service",
         default=None,
         help="systemd --user unit to auto-start if VLM is unreachable "
-             "(e.g. qwen35-turboquant.service)",
+        "(e.g. qwen35-turboquant.service)",
     )
     parser.add_argument(
         "--vlm-autostop",
@@ -922,29 +1005,52 @@ if __name__ == "__main__":
         choices=["scored", "keyframes"],
         default="scored",
         help="scored: top-K by FrameScorer at --vlm-fps (default). "
-             "keyframes: only motion-detected keyframes from FrameSelector "
-             "(--vlm-fps ignored).",
+        "keyframes: only motion-detected keyframes from FrameSelector "
+        "(--vlm-fps ignored).",
     )
-    parser.add_argument("--vlm-dedup-threshold", type=float, default=0.92,
-                        help="Similarity threshold for VLM frame dedup "
-                             "(0.0–1.0, higher = more aggressive). "
-                             "Set to 0 to disable. Default 0.92.")
-    parser.add_argument("--audio", action="store_true",
-                        help="Transcribe audio with whisper.cpp")
-    parser.add_argument("--whisper-model", default="base.en",
-                        help="ggml model name (tiny.en/base.en/small.en/medium.en/large-v3)")
-    parser.add_argument("--whisper-binary", default=None,
-                        help="Path to whisper-cli binary (default: /home/ashie/whisper.cpp/build/bin/whisper-cli)")
-    parser.add_argument("--whisper-gpu-device", type=int, default=1,
-                        help="Vulkan device index. Default 1 = NVIDIA 3060 "
-                             "(0 = AMD 9070 XT but radv has occasional device-lost errors).")
-    parser.add_argument("--whisper-language", default=None,
-                        help="Force language (e.g. 'en'); default = auto-detect")
+    parser.add_argument(
+        "--vlm-dedup-threshold",
+        type=float,
+        default=0.92,
+        help="Similarity threshold for VLM frame dedup "
+        "(0.0–1.0, higher = more aggressive). "
+        "Set to 0 to disable. Default 0.92.",
+    )
+    parser.add_argument(
+        "--audio", action="store_true", help="Transcribe audio with whisper.cpp"
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default="base.en",
+        help="ggml model name (tiny.en/base.en/small.en/medium.en/large-v3)",
+    )
+    parser.add_argument(
+        "--whisper-binary",
+        default=None,
+        help="Path to whisper-cli binary (default: /home/ashie/whisper.cpp/build/bin/whisper-cli)",
+    )
+    parser.add_argument(
+        "--whisper-gpu-device",
+        type=int,
+        default=1,
+        help="Vulkan device index. Default 1 = NVIDIA 3060 "
+        "(0 = AMD 9070 XT but radv has occasional device-lost errors).",
+    )
+    parser.add_argument(
+        "--whisper-language",
+        default=None,
+        help="Force language (e.g. 'en'); default = auto-detect",
+    )
     args = parser.parse_args()
 
     config = PipelineConfig(
         backend="llama-server",
-        modules={"behavior": True, "detection": True, "depth": args.depth, "audio": False},
+        modules={
+            "behavior": True,
+            "detection": True,
+            "depth": args.depth,
+            "audio": False,
+        },
         fps=args.yolo_fps,
         max_frames=999,
         confidence=args.confidence,
