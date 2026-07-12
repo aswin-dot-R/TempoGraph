@@ -268,3 +268,24 @@ walk continues (was: crash before the HTTP try block); black-formatted.
 $ pytest tests/test_dense_walker.py -q  → 21 passed
 $ pytest -q                             → 142 passed
 ```
+
+---
+
+## 2026-07-12 — PS3: EscalationVerifier + parallel orchestrator
+
+Executed by Ornith 35B architect (opencode); gate-reviewed by Fable.
+Suite 142 → 153 passed (11 new tests). `EscalationVerifier` (35B second
+opinions with AGREE/DISAGREE verdicts, 3-retry cap, poll loop) and
+`run_dense_captioning()` — verifier daemon thread starts BEFORE the walk,
+overlap proven by test. Gate-review fix by Fable: capped rows stayed
+unverified in the DB and shadowed later rows behind `LIMIT batch_size`,
+and the all-capped exit could kill the verifier while the walker was
+still producing escalations (e.g. brief 35B outage → 3 fast retries per
+early frame → premature exit). Now over-fetches by the capped count,
+filters in Python, and only exits via the walker-done drain path. Noisy
+per-poll info logs downgraded to debug; black-formatted.
+
+```
+$ pytest tests/test_dense_verifier.py -q  → 11 passed
+$ pytest -q                               → 153 passed
+```
