@@ -251,3 +251,20 @@ Review fixes by Fable: hoisted datetime import to module level, corrected
 $ pytest tests/test_dense_schema.py -q  → 6 passed
 $ pytest -q                             → 121 passed
 ```
+
+---
+
+## 2026-07-12 — PS2: DenseCaptionWalker (9B per-frame captions + escalation)
+
+Executed by Ornith 35B architect (opencode); gate-reviewed by Fable.
+Suite 121 → 142 passed (21 new tests). `src/modules/dense_captioner.py`:
+`parse_two_lines`, `jaccard`, `should_escalate`, pure-python `_percentile`,
+and `DenseCaptionWalker.walk()` — resumable, cancellable, per-frame error
+tolerance, prev-caption threading through skips, retrieval-grade prompt.
+Review fix by Fable: unreadable frame JPEG now counts as an error and the
+walk continues (was: crash before the HTTP try block); black-formatted.
+
+```
+$ pytest tests/test_dense_walker.py -q  → 21 passed
+$ pytest -q                             → 142 passed
+```

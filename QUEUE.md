@@ -11,7 +11,7 @@ States: `spec'd` → `in-progress` → `pre-review (9B)` → `gate review (Fable
 | # | Item | PS file | State |
 |---|---|---|---|
 | 1 | frame_captions schema + WAL + DB helpers | `docs/ps/ps1.md` | **merged** (`52e71f5`, 2026-07-12) |
-| 2 | DenseCaptionWalker (9B, per-frame captions + change lines) | `docs/ps/ps2.md` | spec'd |
+| 2 | DenseCaptionWalker (9B, per-frame captions + change lines) | `docs/ps/ps2.md` | **merged** (2026-07-12) |
 | 3 | EscalationVerifier (35B, parallel second opinions) | `docs/ps/ps3.md` | spec'd |
 | 4 | Pipeline stage + Results UI + aggregator pass | `docs/ps/ps4.md` | spec'd |
 | 5 | Click-to-play (timestamps become video links) | `docs/ps/2026-07-11-click-to-play-ps.md` (needs Ornith-sizing pass by Fable) | queued |
