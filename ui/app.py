@@ -57,6 +57,7 @@ DEFAULT_KNOBS = {
     "context_threshold": 0.80,
     "keep_vlm_running": False,
     "threshold_mult": 1.0,
+    "dense_captions": True,
 }
 
 
@@ -202,7 +203,7 @@ def _render_recent_runs():
             f"Open: {r['name']}", key=f"open_run_{r['name']}", use_container_width=True
         ):
             st.session_state["selected_run"] = r["name"]
-            st.switch_page("ui/pages/Results.py")
+            st.switch_page("pages/Results.py")
 
 
 # ── Screen 2: Plan ──────────────────────────────────────────────────
@@ -463,12 +464,14 @@ def _render_progress_screen():
         "Frame selection": "queued",
         "Audio transcription": "queued",
         "YOLO detection": "queued",
+        "Dense captions": "queued",
         "Depth estimation": "queued",
         "Frame scoring": "queued",
         "VLM captioning": "queued",
         "Aggregation": "queued",
     }
 
+    navigate_to_results = False
     with st.spinner("Running pipeline..."):
         try:
             camera_map = {
@@ -497,6 +500,9 @@ def _render_progress_screen():
                 vlm_model="ornith-1.0-9b-Q4_K_M.gguf",
                 vlm_autostart_service=None,
                 vlm_autostop=False,
+                dense_captions=overrides.get("dense_captions", True),
+                walker_url="http://127.0.0.1:8085",
+                verifier_url="http://127.0.0.1:8096",
                 vlm_frame_mode=overrides["vlm_frame_mode"],
                 vlm_dedup_threshold=overrides["vlm_dedup_threshold"],
                 dynamic_chunking=overrides["dynamic_chunking"],
@@ -536,21 +542,25 @@ def _render_progress_screen():
 
             st.success(f"Done in {result.processing_time:.1f}s")
 
-            # Navigate to results
+            # Navigate to results — outside the try below, because
+            # st.switch_page signals via a control-flow exception that a
+            # generic `except Exception` would swallow as a failure.
             st.session_state[KEY_RUNNING] = False
             st.session_state[KEY_PLAN] = None
             st.session_state["selected_run"] = video_name
-            st.info("Analysis complete. Opening results...")
-            st.switch_page("ui/pages/Results.py")
+            navigate_to_results = True
 
         except KeyboardInterrupt:
             st.warning("Pipeline cancelled.")
             st.session_state[KEY_RUNNING] = False
             st.session_state[KEY_PLAN] = None
         except Exception as e:
-            stage_status["error"] = "done"
             st.error(f"Pipeline failed: {e}")
             st.session_state[KEY_RUNNING] = False
+
+        if navigate_to_results:
+            st.info("Analysis complete. Opening results...")
+            st.switch_page("pages/Results.py")
 
     # Stage checklist
     st.divider()

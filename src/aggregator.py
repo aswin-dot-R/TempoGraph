@@ -213,7 +213,15 @@ class CaptionAggregator:
             transcript=transcript_text or "(no transcript)",
         )
         response_text = self._call_llm_text(prompt)
-        return self.parser.parse(response_text)
+        result = self.parser.parse(response_text)
+        if result.summary.startswith("JSON parse error"):
+            # Local models occasionally emit malformed JSON; one fresh
+            # generation usually fixes it. Keep the retry either way.
+            self.logger.warning(
+                f"aggregation JSON unparseable ({result.summary}); retrying once"
+            )
+            result = self.parser.parse(self._call_llm_text(prompt))
+        return result
 
     @staticmethod
     def _format_transcript(segments: list) -> str:
