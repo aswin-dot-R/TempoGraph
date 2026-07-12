@@ -30,6 +30,10 @@ from src.annotate import (  # noqa: E402
 )
 from src.annotate import apply_depth_overlay as _apply_depth_overlay_abs  # noqa: E402
 from src.storage import TempoGraphDB as _TempoGraphDB  # noqa: E402
+from ui.video_player import (  # noqa: E402
+    resolve_video as _resolve_video,
+    render_player as _render_player,
+)
 
 
 # ─── data access ──────────────────────────────────────────────────────────────
@@ -540,13 +544,18 @@ def _render_frame_inspector(
             return
 
         indices = [f["frame_idx"] for f in frames]
-        chosen_idx = st.select_slider(
+        c_slider, c_play = st.columns([5, 1])
+        chosen_idx = c_slider.select_slider(
             "Scrub through frames",
             options=indices,
             value=indices[0],
             format_func=lambda i: f"#{i}",
         )
         fr = next(f for f in frames if f["frame_idx"] == chosen_idx)
+        if c_play.button("▶ Play from here", key=f"play_frame_{chosen_idx}"):
+            st.session_state["player_start_s"] = fr["timestamp_ms"] / 1000.0
+            st.session_state["player_requested"] = True
+            st.rerun()
 
         masks_available = _has_masks(det_by_frame)
         c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
@@ -841,21 +850,20 @@ def _render_entity_inspector(bundle: dict, analysis: Optional[dict]) -> None:
         if chosen in r["entity_ids"]
     ]
     if rows:
-        st.dataframe(
-            [
-                {
-                    "type": r["type"],
-                    "start_s": round(r["start"], 2),
-                    "end_s": round(r["end"], 2),
-                    "conf": round(r["confidence"], 2),
-                    "co_entities": ", ".join(e for e in r["entity_ids"] if e != chosen),
-                    "description": r["description"],
-                }
-                for r in rows
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+        for r in rows:
+            mm_s = int(r["start"] // 60)
+            ss_s = r["start"] - mm_s * 60
+            mm_e = int(r["end"] // 60)
+            ss_e = r["end"] - mm_e * 60
+            time_str = f"{mm_s:02d}:{ss_s:05.2f}–{mm_e:02d}:{ss_e:05.2f}"
+            c1, c2, c3, c4 = st.columns([0.5, 2, 3, 6])
+            if c1.button("▶", key=f"play_ev_{r['ev_idx']}"):
+                st.session_state["player_start_s"] = r["start"]
+                st.session_state["player_requested"] = True
+                st.rerun()
+            c2.caption(time_str)
+            c3.write(r["type"])
+            c4.write(r["description"])
         st.markdown("#### Timeline (filtered)")
         frames = bundle["frames"]
         span_s = (
@@ -896,8 +904,9 @@ def _render_entity_inspector(bundle: dict, analysis: Optional[dict]) -> None:
             img = _draw_detections(
                 img, det_by_frame.get(fr["frame_idx"], []), min_conf=0.25
             )
+            ts_s = fr["timestamp_ms"] / 1000.0
             col.image(_bgr_to_png_bytes(img), width="stretch")
-            col.caption(f"#{fr['frame_idx']} · t={fr['timestamp_ms']/1000:.2f}s")
+            col.caption(f"#{fr['frame_idx']} · t={ts_s:.2f}s")
 
 
 def _build_annotated_video(
@@ -1468,28 +1477,32 @@ def _render_captions(run_dir: Path, bundle: dict) -> None:
         st.write(full_text)
 
         st.markdown("#### Segments")
-        rows = []
-        for s in segments:
+        # Pagination: pages of 100 when past 200 segments.
+        pages_shown = int(st.session_state.get("transcript_pages", 0))
+        if len(segments) > 200:
+            max_visible = min(100 * (pages_shown + 1), len(segments))
+            visible = segments[:max_visible]
+            if st.button("Show more", key="show_more_transcript"):
+                st.session_state["transcript_pages"] = pages_shown + 1
+                st.rerun()
+        else:
+            visible = segments
+
+        for s in visible:
             start_s = s["start_ms"] / 1000.0
             end_s = s["end_ms"] / 1000.0
             mm = int(start_s // 60)
             ss = start_s - mm * 60
             mm2 = int(end_s // 60)
             ss2 = end_s - mm2 * 60
-            rows.append(
-                {
-                    "start": f"{mm:02d}:{ss:05.2f}",
-                    "end": f"{mm2:02d}:{ss2:05.2f}",
-                    "duration_s": round(end_s - start_s, 2),
-                    "text": s["text"].strip(),
-                    "no_speech_prob": (
-                        round(s["no_speech_prob"], 3)
-                        if s.get("no_speech_prob") is not None
-                        else None
-                    ),
-                }
-            )
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+            time_str = f"{mm:02d}:{ss:05.2f}–{mm2:02d}:{ss2:05.2f}"
+            c1, c2, c3 = st.columns([0.5, 2, 8])
+            if c1.button("▶", key=f"play_seg_{s['segment_id']}"):
+                st.session_state["player_start_s"] = start_s
+                st.session_state["player_requested"] = True
+                st.rerun()
+            c2.caption(time_str)
+            c3.write(s["text"].strip())
 
         # Dense caption timeline (PS4): one row per escalated entry,
         # text = verifier caption when disagreed, else walker caption.
@@ -1690,12 +1703,49 @@ def _render_multimodal_correlations(analysis: Optional[dict]) -> None:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
+def _render_player_slot(run_dir: Path, bundle: dict) -> None:
+    """Render the click-to-play video player if one was requested.
+
+    Reads ``st.session_state["player_requested"]`` and
+    ``st.session_state["player_start_s"]``. When no playable video is found
+    (neither original nor annotated strip), shows an info message instead of
+    crashing. Clears the request flag after rendering so the slot does not
+    reappear on every subsequent rerun.
+    """
+    if not st.session_state.get("player_requested"):
+        return
+    db = _TempoGraphDB(run_dir / "tempograph.db")
+    try:
+        source = _resolve_video(run_dir, db)
+    finally:
+        db.close()
+    if source is None:
+        st.info(
+            "No playable video for this run. Build an annotated strip in the "
+            "'Annotated video' tab or re-run the pipeline to capture the "
+            "original source."
+        )
+        st.session_state["player_requested"] = False
+        return
+    start_s = float(st.session_state.get("player_start_s", 0.0))
+    _render_player(source, start_s)
+    st.session_state["player_requested"] = False
+
+
 # ─── entry ────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
     st.set_page_config(page_title="TempoGraph results", layout="wide")
     st.title("TempoGraph v2 — Results browser")
+
+    # Initialise click-to-play session state so the first button click works.
+    if "player_requested" not in st.session_state:
+        st.session_state.player_requested = False
+    if "player_start_s" not in st.session_state:
+        st.session_state.player_start_s = 0.0
+    if "transcript_pages" not in st.session_state:
+        st.session_state.transcript_pages = 0
 
     run_dir = _render_run_picker()
     if run_dir is None:
@@ -1744,6 +1794,7 @@ def main() -> None:
     )
 
     with overview:
+        _render_player_slot(run_dir, bundle)
         _render_summary(run_dir, analysis, bundle)
         st.divider()
         _render_entities_table(analysis)
@@ -1756,18 +1807,23 @@ def main() -> None:
         _render_frame_thumbnails(run_dir, bundle)
 
     with frame_tab:
+        _render_player_slot(run_dir, bundle)
         _render_frame_inspector(run_dir, bundle, analysis)
 
     with entity_tab:
+        _render_player_slot(run_dir, bundle)
         _render_entity_inspector(bundle, analysis)
 
     with graph_tab:
+        _render_player_slot(run_dir, bundle)
         _render_graph_tab(run_dir, bundle, analysis)
 
     with vlm_tab:
+        _render_player_slot(run_dir, bundle)
         _render_vlm_chunks(run_dir, bundle)
 
     with captions_tab:
+        _render_player_slot(run_dir, bundle)
         _render_captions(run_dir, bundle)
 
     with interactive_tab:
@@ -1777,12 +1833,15 @@ def main() -> None:
         _render_video_player(run_dir, bundle)
 
     with ask_tab:
+        _render_player_slot(run_dir, bundle)
         _render_ask_tab(run_dir, bundle, analysis)
 
     with dataset_tab:
+        _render_player_slot(run_dir, bundle)
         _render_dataset_export(run_dir, bundle)
 
     with files_tab:
+        _render_player_slot(run_dir, bundle)
         _render_artifacts(run_dir)
 
 

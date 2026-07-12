@@ -343,3 +343,21 @@ $ pytest -q                                         → 166 passed
 $ python -m src.pipeline_v2 --video file_example... → Done in 4.0s (was: crash)
 $ derive_plan(probe(...)) → depth_enabled: False, notes: ['depth off: transformers not installed']
 ```
+
+---
+
+## 2026-07-13 — PS5: click-to-play (parallel lanes, Fable-driven)
+
+First fully Fable-orchestrated parallel item: 35B implemented (ps5a), 9B
+wrote 16 tests (ps5b) simultaneously; 35B then ran the gate seam-fix from
+Fable's failure diagnosis. All 6 combined-run failures were TEST-lane
+bugs (1-based segment_id assumption, nonexistent frame index, unbuilt
+250-segment fixture, unguarded key=None); the implementation was
+contract-correct throughout. Suite 166 → 182. ui/video_player.py
+(resolve_video / make_strip_mapper / render_player) + every timestamp
+surface in Results.py wired to one sticky player with pagination.
+
+```
+$ pytest -q → 182 passed
+$ streamlit headless boot → UI_BOOTS
+```

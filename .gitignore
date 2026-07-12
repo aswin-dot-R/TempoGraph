@@ -66,3 +66,4 @@ config
 hooks/
 objects/
 refs/
+.claude/settings.local.json
