@@ -126,6 +126,160 @@ alert hook (shell-out to `hermes` CLI). Design doc first, with the user.
 
 ---
 
+## 6. [USER-SUPERVISED] Live mode + Hermes alerts — DO NOT run unattended
+
+RTSP/webcam rolling analysis with event alerts through the user's Hermes
+gateway. Requires cameras, service coordination, and GPU-budget decisions
+an unattended agent must not make. Sketch: `src/live_runner.py` ring-buffer
+ingestion → periodic mini-pipeline over the last N seconds → event diff →
+alert hook (shell-out to `hermes` CLI). Design doc first, with the user.
+
+## 7. Natural-language search — "find the part where the bird lands on the feeder"
+
+**Why:** the DB already has every caption and transcript indexed by timestamp.
+Expose it as a search bar instead of the 8-tab UI.
+
+- `src/search.py`: SQL FTS5 index on `analysis.json` caption text +
+  transcript text. Simple keyword + fuzzy match first (FTS5 does this
+  natively), later add BM25 scoring. Interface:
+  `search(db, query, entity_filter=None, run_filter=None, limit=20) ->
+  [row]` where each row has `run_id, timestamp_ms, frame_idx, snippet,
+  type ("caption"|"transcript"|"detection")`.
+- UI: add a search bar at the top of the Results page or a dedicated
+  "Search" page. Each result is a clickable entry → jumps the frame
+  inspector to that timestamp. Snippet highlighting.
+- **Acceptance:** fixture DB with 100+ caption rows → query returns
+  relevant results ranked by snippet relevance; FTS5 virtual table
+  survives DB vacuum; AppTest renders search + click-to-jump works.
+  Suite green.
+
+## 8. Highlight reel auto-generation — "most interesting 60 seconds"
+
+**Why:** the frame scorer already ranks frames by information density.
+Stitch the top-K into a summary clip.
+
+- `src/highlight_reel.py`: given a run DB, pick frames by `delta_score`
+  (highest first, spaced ≥ N seconds apart to avoid redundancy), group
+  into contiguous spans, run ffmpeg to extract + concatenate with fade
+  transitions. Config: target duration (default 60s), min gap (default
+  3s), mode (top-scored / random-weighted-by-score / one-per-entity).
+- UI: "Highlight Reel" card on the Overview tab or a standalone tab.
+  Preview player + download button.
+- **Acceptance:** smoke run → 60s reel extracted, ffprobe-valid, player
+  renders in AppTest. Suite green.
+
+## 9. Activity recognition — high-level labels beyond raw captions
+
+**Why:** captions describe "dog sitting near bowl" but don't label the
+abstract activity. A lightweight classifier on the structured output
+adds that layer.
+
+- `src/activity_recognizer.py`: simple rule-based + ML path. Rules first:
+  "eats" = entity near food bowl + mouth open + duration > 3s. Then a
+  lightweight model (sklearn RandomForest on handcrafted features:
+  entity classes, bbox positions, durations, inter-entity distances,
+  audio volume). Model weights saved as pickle in `lib/`.
+- Training data: manually label 50–100 events from existing fixture DBs.
+  Export as JSONL, train, persist. Interface:
+  `classify_events(db, model_path) -> [(event_id, label, confidence)]`.
+- UI: new column in the event table on Overview. Filter by activity type.
+- **Acceptance:** trained model on 50 events → 80%+ accuracy on held-out
+  20 events; AppTest renders the column and filter. Suite green.
+
+## 10. Smart alerts / webhooks — "notify me when X happens"
+
+**Why:** once the pipeline produces structured events, act on them.
+
+- `src/alerts.py`: config-driven rule engine. Rules live in a YAML file:
+  `rules.yaml` — each rule has `condition` (entity present > N seconds,
+  entity count > threshold, audio spike, new entity), `action` (shell
+  command, webhook POST, file trigger). Simple polling: after each
+  pipeline stage, check rules against current DB state.
+- `src/webhook.py`: tiny HTTP server (or just POST via `requests`) to
+  push events to a user-configurable URL (Hermes gateway, ntfy, Telegram,
+  Discord, etc.). Payload: `{run, entity, event, timestamp, video_url}`.
+- **Acceptance:** unit test for rule evaluation on synthetic DB; integration
+  test → rule fires → mock webhook server receives the payload; no
+  unattended GPU work. Suite green.
+- **[USER-SUPERVISED]**: real webhook destination setup, Telegram/Discord
+  bot config.
+
+## 11. Home Assistant integration
+
+**Why:** TempoGraph already detects entities and events. Expose them as HA
+entities for smart-home automation.
+
+- `src/ha_integration.py`: publishes state to Home Assistant MQTT Discovery
+  (or REST API). Each canonical entity becomes a sensor:
+  `sensor.kitchen_occupied` (bool), `sensor.front_porch_packages` (count),
+  `sensor.garden_activity` (last event). Updates on pipeline completion.
+- Config: `ha_config.yaml` — which entities to expose, MQTT broker address,
+  entity categories.
+- **Acceptance:** unit test for MQTT payload format; integration test with
+  a local MQTT broker (testcontainers or mock); no actual HA instance
+  required for CI. Suite green.
+- **[USER-SUPERVISED]**: actual HA setup, user configures their broker.
+
+## 12. Cross-video comparison / temporal trends
+
+**Why:** run the pipeline on a directory, chart how things change over days
+or weeks.
+
+- `src/trends.py`: takes a list of run DBs, extracts per-entity entity
+  counts, event durations, activity labels over time. Produces a JSONL
+  time series.
+- UI: "Trends" page — Plotly line charts / bar charts with date range
+  picker. Compare entity counts across days, activity distribution pie
+  charts, etc.
+- **Acceptance:** 3+ fixture DBs with staggered timestamps → chart renders
+  in AppTest, data points match expected counts. Suite green.
+
+## 13. Sound classification — detect what you hear, not just what you say
+
+**Why:** Whisper transcribes speech but misses non-speech events (glass
+break, doorbell, barking, alarms).
+
+- `src/sound_classifier.py`: load a pre-trained audio classification model
+  (torchlibrosa + small CNN, or use a local ONNX model). Classes: doorbell,
+  glass break, bark, cry, alarm, silence, speech, music. Process audio
+  segments from Whisper output in 1–5s windows.
+- Store results in DB: new `audio_events` table linked to
+  `audio_segments`. Aggregator picks them up for `analysis.json`.
+- UI: "Sounds" tab next to Captions — timeline of non-speech events with
+  class labels.
+- **Acceptance:** test on 10 labeled audio clips → ≥ 85% top-1 accuracy;
+  AppTest renders Sounds tab. Suite green.
+
+## 14. Automated daily / periodic reports
+
+**Why:** turn structured data into prose you can email or read in the morning.
+
+- `src/reporter.py`: template-based report generator. Pulls from
+  `analysis.json` + trends → "Today: 3 packages delivered, garden activity
+  up 20%, 47 minutes of bird song detected. Notable events: ..."
+- Prompt-based path: send the structured summary to Qwen with a prompt like
+  "Write a concise morning briefing from this data." Heuristic path:
+  templated prose without LLM.
+- CLI: `make report --date today --format text|html|markdown`
+- **Acceptance:** generate report from a fixture DB → output contains
+  ≥ 3 factual statements matching the DB; HTML output renders in browser;
+  AppTest checks text output. Suite green.
+
+## 15. Embeddable / shareable widgets
+
+**Why:** the 8-tab Results page is heavy. Let users share individual views
+as standalone HTML.
+
+- `src/widget_export.py`: take any tab's data (timeline, graph, entity
+  table, ethogram) and render as a self-contained HTML file with
+  embedded Plotly / vis.js + data. No server required.
+- UI: "Export this view as HTML" button on each tab.
+- **Acceptance:** exported HTML opens in a browser without any server;
+  Plotly graph is interactive; AppTest checks file is valid HTML. Suite
+  green.
+
+---
+
 ## Done in v3 (for the record)
 
 Drop→plan→progress UI, auto_profile, per-run Ask tab, summarizer with
