@@ -361,3 +361,21 @@ surface in Results.py wired to one sticky player with pagination.
 $ pytest -q → 182 passed
 $ streamlit headless boot → UI_BOOTS
 ```
+
+---
+
+## 2026-07-13 — PS6: natural-language search (parallel lanes, Fable-driven)
+
+35B implemented src/search.py (FTS5 index over transcript + dense
+captions + change lines + verifier opinions + detection classes +
+analysis.json events; bm25; query sanitising; E2B :8093 query rewrite
+with graceful fallback) + Search tab with show-frame / play-span actions.
+9B wrote 14 tests. Gate seam-fix by 35B from Fable's diagnosis: 13
+failures were one invented kwarg in the test fixture
+(insert_frame_caption(verifier_caption=...) → real two-call API), plus
+str/str path bugs and key=None guards. Suite 182 → 196.
+
+```
+$ pytest -q --ignore=tests/test_highlight_reel.py → 196 passed
+```
+(highlight_reel tests excluded: 9B mid-write on PS7b at gate time)

@@ -29,6 +29,12 @@ from src.annotate import (  # noqa: E402
     draw_masks as _draw_masks,
 )
 from src.annotate import apply_depth_overlay as _apply_depth_overlay_abs  # noqa: E402
+from src.search import (  # noqa: E402
+    build_search_index as _build_search_index,
+    rewrite_query as _rewrite_query,
+    search as _search,
+    SearchHit,
+)
 from src.storage import TempoGraphDB as _TempoGraphDB  # noqa: E402
 from ui.video_player import (  # noqa: E402
     resolve_video as _resolve_video,
@@ -677,6 +683,135 @@ def _render_frame_inspector(
                 st.write("_none active_")
     finally:
         db.close()
+
+
+def _render_search_tab(run_dir: Path, bundle: dict, analysis: Optional[dict]) -> None:
+    """Natural-language search across transcripts, captions, detections, and events."""
+    st.subheader("Search")
+    st.caption(
+        "Search across the run's audio transcript, dense captions, "
+        "detection classes, and visual events."
+    )
+
+    if "search_query" not in st.session_state:
+        st.session_state.search_query = ""
+    if "search_source_filter" not in st.session_state:
+        st.session_state.search_source_filter = ""
+
+    c1, c2 = st.columns([3, 1])
+    query = c1.text_input(
+        "Query",
+        value=st.session_state.search_query,
+        key="search_query",
+        placeholder="e.g. bird lands on the feeder",
+    )
+    source_filter = c2.selectbox(
+        "Source type",
+        [""]
+        + [
+            "transcript",
+            "caption",
+            "change",
+            "verifier",
+            "detection",
+            "event",
+        ],
+        format_func=lambda s: s or "(all sources)",
+        key="search_source_filter",
+    )
+
+    if not query or not query.strip():
+        st.info("Type a query above to search across this run.")
+        return
+
+    db_path = run_dir / "tempograph.db"
+
+    # Attempt query rewriting via the local Gemma E2B server.
+    rewritten = query
+    try:
+        rewritten = _rewrite_query(query.strip())
+    except Exception:
+        rewritten = query
+
+    if rewritten and rewritten != query:
+        st.caption(f"Searching terms: **{rewritten}**")
+
+    # Run the search with rewritten terms first; fall back to raw query.
+    hits: List[SearchHit] = []
+    used_query = rewritten or query
+
+    try:
+        hits = _search(
+            db_path,
+            used_query,
+            limit=30,
+            source_filter=source_filter or None,
+        )
+    except Exception as e:
+        st.error(f"Search failed: {e}")
+        return
+
+    if not hits:
+        # Try again with the raw query (rewrite may have over-expanded).
+        if used_query != query:
+            try:
+                hits = _search(
+                    db_path,
+                    query.strip(),
+                    limit=30,
+                    source_filter=source_filter or None,
+                )
+            except Exception:
+                pass
+
+        if not hits:
+            st.info(
+                f"No hits for **_{query.strip()}_** "
+                f"({'source: ' + source_filter if source_filter else 'all sources'}). "
+                "Try a different query or rebuild the index."
+            )
+            return
+
+    st.caption(f"**{len(hits)}** hit(s) for _{query.strip()}_")
+
+    # Render results.
+    for i, hit in enumerate(hits):
+        mm_s = hit.timestamp_ms // 60000
+        ss_s = (hit.timestamp_ms % 60000) / 1000.0
+        time_str = f"{mm_s:02d}:{ss_s:05.2f}"
+
+        snippet_html = (
+            f"<div style='font-size:13px;line-height:1.5'>"
+            f"{time_str} &middot; <b>{hit.source_type}</b> &middot; "
+            f"{hit.snippet}</div>"
+        )
+
+        c_left, c_mid, c_right = st.columns([3, 1, 1])
+        c_left.markdown(snippet_html, unsafe_allow_html=True)
+
+        # "Jump to frame" button when the hit has a frame_idx.
+        find_frame_key = f"find_frame_{i}"
+        find_play_key = f"find_play_{i}"
+
+        if hit.frame_idx is not None:
+            if c_mid.button(
+                "Frame",
+                key=find_frame_key,
+                help=f"Jump to frame #{hit.frame_idx}",
+            ):
+                st.session_state["inspector_frame_idx"] = hit.frame_idx
+        else:
+            c_mid.caption(f"#{hit.timestamp_ms} ms")
+
+        # "Play from this timestamp" button.
+        if c_right.button(
+            "Play",
+            key=find_play_key,
+            help=f"Play from {time_str}",
+        ):
+            st.session_state["player_start_s"] = hit.timestamp_ms / 1000.0
+            st.session_state["player_requested"] = True
+            st.rerun()
 
 
 def _render_ask_tab(run_dir: Path, bundle: dict, analysis: Optional[dict]) -> None:
@@ -1756,6 +1891,7 @@ def main() -> None:
 
     (
         overview,
+        search_tab,
         frame_tab,
         entity_tab,
         graph_tab,
@@ -1769,6 +1905,7 @@ def main() -> None:
     ) = st.tabs(
         [
             "Overview",
+            "Search",
             "Frame inspector",
             "Entity inspector",
             "Graph",
@@ -1805,6 +1942,9 @@ def main() -> None:
         _render_multimodal_correlations(analysis)
         st.divider()
         _render_frame_thumbnails(run_dir, bundle)
+
+    with search_tab:
+        _render_search_tab(run_dir, bundle, analysis)
 
     with frame_tab:
         _render_player_slot(run_dir, bundle)
