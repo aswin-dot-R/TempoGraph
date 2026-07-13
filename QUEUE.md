@@ -26,12 +26,12 @@ States: `spec'd` → `in-progress` → `gate review (Fable)` → `merged`
 
 | # | Item | PS files | State |
 |---|---|---|---|
-| 5 | **Click-to-play** — every timestamp plays the video | `ps5a.md` (impl, 35B) + `ps5b.md` (tests, 9B) | spec'd |
+| 5 | Click-to-play (both lanes) | `ps5a.md` + `ps5b.md` | **merged** (`942c080`, 2026-07-13) |
 | 6 | Natural-language search (both lanes) | `ps6a.md` + `ps6b.md` | **merged** (2026-07-13) |
 | 7 | Highlight reel (both lanes) | `ps7a.md` + `ps7b.md` | **merged** (2026-07-13) |
-| 7.5 | **UI facelift** — the drop-flow and Results page look stock-Streamlit; needs a visual identity before the demo GIF. Custom theme (.streamlit/config.toml), landing hero, styled stage checklist, consistent tab headers/cards, dark-first palette. | `docs/ps/ps7-5.md` | in-progress (35B) |
-| 8 | **Ship hardening + packaging** — settings/env config, no hardcoded paths, run-dir collisions fixed, requirements fixed, LICENSE (MIT), GIF-first README with comparison table, HARDWARE.md, Dockerfile, CI | `ps8a.md` (hardening, 35B) + `ps8b.md` (tests + collateral, 9B) | spec'd |
-| 9 | **SHIP v1.0** — Fable-led release checklist: full suite + smoke on real footage, README GIF recorded by human, repo scrub (`results/`, `*.pt`, personal paths), squash-review of branch, merge to main, tag v1.0.0, push to public GitHub | (no PS — gate session) | blocked on 5–8 |
+| 7.5 | UI facelift — dark-first theme, hero, cards | `docs/ps/ps7-5.md` | **merged** (`acff9a4`, 2026-07-13) |
+| 8 | Ship hardening + packaging (both lanes) | `ps8a.md` + `ps8b.md` | **merged** (`840c682`, 2026-07-13) |
+| 9 | **SHIP v1.0** — Fable-led release checklist: full suite + smoke on real footage, README GIF recorded by human, repo scrub (`results/`, `*.pt`, personal paths), squash-review of branch, merge to main, tag v1.0.0, push to public GitHub | (no PS — gate session) | **READY — needs human: demo GIF + GitHub remote** |
 
 Definition of shipped: a stranger with one GPU clones the repo, runs
 `make install && make run`, drops a video, and gets transcript, dense
