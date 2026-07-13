@@ -143,7 +143,7 @@ class PipelineV2:
             )
             raise RuntimeError(
                 f"VLM server not reachable at {self.vlm_url}. "
-                "Start it with: systemctl --user start qwen35-turboquant.service"
+                "Start your llama-server VLM or point TEMPOGRAPH_VLM_URL at it."
             )
 
         self._stage("VLM autostart", "start", service=self.vlm_autostart_service)
@@ -996,13 +996,12 @@ if __name__ == "__main__":
     parser.add_argument("--skip-vlm", action="store_true")
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--threshold-mult", type=float, default=1.0)
-    parser.add_argument("--vlm-url", default="http://127.0.0.1:8082")
-    parser.add_argument("--vlm-model", default="Qwen3.5-9B-Q8_0.gguf")
+    parser.add_argument("--vlm-url", default=get_settings().vlm_url)
+    parser.add_argument("--vlm-model", default=get_settings().vlm_model)
     parser.add_argument(
         "--vlm-autostart-service",
         default=None,
-        help="systemd --user unit to auto-start if VLM is unreachable "
-        "(e.g. qwen35-turboquant.service)",
+        help="systemd --user unit to auto-start if VLM is unreachable",
     )
     parser.add_argument(
         "--vlm-autostop",

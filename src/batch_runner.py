@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 
 from src.models import CameraMode, PipelineConfig
 from src.pipeline_v2 import PipelineV2
+from src.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +54,10 @@ class BatchRunner:
         yolo_size: str = "n",
         threshold_mult: float = 1.0,
         vlm_dedup_threshold: float = 0.92,
-        vlm_url: str = "http://127.0.0.1:8082",
-        vlm_model: str = "Qwen3.5-9B-Q8_0.gguf",
+        vlm_url: Optional[str] = None,
+        vlm_model: Optional[str] = None,
         vlm_frame_mode: str = "keyframes",
-        vlm_autostart_service: Optional[str] = "qwen35-turboquant.service",
+        vlm_autostart_service: Optional[str] = None,
         vlm_autostop: bool = False,
         audio_enabled: bool = False,
         whisper_model: str = "base.en",
@@ -77,8 +78,8 @@ class BatchRunner:
         self.yolo_size = yolo_size
         self.threshold_mult = threshold_mult
         self.vlm_dedup_threshold = vlm_dedup_threshold
-        self.vlm_url = vlm_url
-        self.vlm_model = vlm_model
+        self.vlm_url = vlm_url or get_settings().vlm_url
+        self.vlm_model = vlm_model or get_settings().vlm_model
         self.vlm_frame_mode = vlm_frame_mode
         self.vlm_autostart_service = vlm_autostart_service
         self.vlm_autostop = vlm_autostop
@@ -271,9 +272,9 @@ def main():
     parser.add_argument(
         "--vlm-frame-mode", default="keyframes", choices=["scored", "keyframes"]
     )
-    parser.add_argument("--vlm-url", default="http://127.0.0.1:8082")
-    parser.add_argument("--vlm-model", default="Qwen3.5-9B-Q8_0.gguf")
-    parser.add_argument("--vlm-autostart-service", default="qwen35-turboquant.service")
+    parser.add_argument("--vlm-url", default=None)
+    parser.add_argument("--vlm-model", default=None)
+    parser.add_argument("--vlm-autostart-service", default=None)
     parser.add_argument(
         "--vlm-autostop",
         action="store_true",

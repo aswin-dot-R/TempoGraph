@@ -1187,38 +1187,11 @@ def main() -> None:
         try:
             _req.get(f"{vlm_url}/v1/models", timeout=2)
         except Exception:
-            progress.progress(
-                0.0, text="Starting VLM service (qwen35-turboquant.service)..."
+            st.error(
+                f"VLM server not reachable at {vlm_url}. Start your "
+                "llama-server VLM or point TEMPOGRAPH_VLM_URL at it."
             )
-            import subprocess
-
-            try:
-                subprocess.run(
-                    ["systemctl", "--user", "start", "qwen35-turboquant.service"],
-                    check=True,
-                    capture_output=True,
-                    timeout=15,
-                )
-                # Wait for it to become ready
-                ready = False
-                for _ in range(60):
-                    import time
-
-                    time.sleep(1.0)
-                    try:
-                        if (
-                            _req.get(f"{vlm_url}/v1/models", timeout=1).status_code
-                            == 200
-                        ):
-                            ready = True
-                            break
-                    except Exception:
-                        pass
-                if not ready:
-                    st.error(f"VLM service did not become reachable at {vlm_url}")
-                    return
-            except Exception as e:
-                st.warning(f"Failed to autostart VLM service: {e}")
+            return
 
         # ── context-aware batching ──
         # Query n_ctx from the VLM server for dynamic batch sizing
