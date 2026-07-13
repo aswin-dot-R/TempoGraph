@@ -22,8 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-DEFAULT_BINARY = "/home/ashie/whisper.cpp/build/bin/whisper-cli"
-DEFAULT_MODEL_DIR = "/home/ashie/whisper.cpp/models"
+from src.settings import get_settings
+
+DEFAULT_BINARY = get_settings().whisper_binary
+DEFAULT_MODEL_DIR = get_settings().whisper_model_dir
 
 # Vulkan device mapping for the current workstation.
 # Device 0 = AMD RX 9070 XT, Device 1 = NVIDIA RTX 3060.
@@ -66,7 +68,9 @@ class WhisperCppTranscriber:
     def ensure_model_downloaded(self) -> None:
         if self.model_path().exists():
             return
-        download_script = Path(self.model_dir).parent / "models" / "download-ggml-model.sh"
+        download_script = (
+            Path(self.model_dir).parent / "models" / "download-ggml-model.sh"
+        )
         if not download_script.exists():
             raise RuntimeError(
                 f"Model {self.model} not found at {self.model_path()} and "
@@ -84,11 +88,23 @@ class WhisperCppTranscriber:
         """Extract mono 16kHz PCM audio from any input video."""
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", video_path,
-                "-vn", "-ar", "16000", "-ac", "1",
-                "-c:a", "pcm_s16le", out_wav,
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-vn",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                out_wav,
             ],
-            check=True, capture_output=True, text=True, timeout=300,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
         )
 
     def _build_device_attempts(self) -> List[Optional[int]]:
@@ -113,15 +129,21 @@ class WhisperCppTranscriber:
         return attempts
 
     def _run_whisper_cli(
-        self, wav_path: str, json_out: str, device: Optional[int],
+        self,
+        wav_path: str,
+        json_out: str,
+        device: Optional[int],
     ) -> subprocess.CompletedProcess:
         """Run whisper-cli with the given device. Returns CompletedProcess."""
         cmd = [
             self.binary,
-            "-m", str(self.model_path()),
-            "-f", wav_path,
+            "-m",
+            str(self.model_path()),
+            "-f",
+            wav_path,
             "-oj",
-            "-of", json_out,
+            "-of",
+            json_out,
         ]
         if device is None:
             cmd += ["--no-gpu"]
@@ -134,7 +156,11 @@ class WhisperCppTranscriber:
 
         self.logger.info(f"Running whisper-cli: {' '.join(cmd)}")
         return subprocess.run(
-            cmd, check=False, capture_output=True, text=True, timeout=1800,
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1800,
         )
 
     def transcribe_video(self, video_path: str) -> List[WhisperSegment]:
@@ -197,9 +223,7 @@ class WhisperCppTranscriber:
                             f"whisper-cli on {device_label} exited 0 "
                             f"but produced no JSON output."
                         )
-                        last_error = RuntimeError(
-                            f"No JSON output from {device_label}"
-                        )
+                        last_error = RuntimeError(f"No JSON output from {device_label}")
                         continue
 
                     with open(json_path) as f:
@@ -216,17 +240,13 @@ class WhisperCppTranscriber:
                     self.logger.warning(
                         f"whisper-cli timed out on {device_label} (30m limit)"
                     )
-                    last_error = RuntimeError(
-                        f"Timeout on {device_label}"
-                    )
+                    last_error = RuntimeError(f"Timeout on {device_label}")
                     continue
                 except json.JSONDecodeError as e:
                     self.logger.warning(
                         f"whisper-cli on {device_label} produced invalid JSON: {e}"
                     )
-                    last_error = RuntimeError(
-                        f"Invalid JSON from {device_label}: {e}"
-                    )
+                    last_error = RuntimeError(f"Invalid JSON from {device_label}: {e}")
                     continue
 
             # All attempts exhausted
@@ -242,18 +262,24 @@ class WhisperCppTranscriber:
         out: List[WhisperSegment] = []
         for s in segments_raw:
             offsets = s.get("offsets") or {}
-            start_ms = int(offsets.get("from") if "from" in offsets else s.get("start", 0) * 1000)
-            end_ms = int(offsets.get("to") if "to" in offsets else s.get("end", 0) * 1000)
+            start_ms = int(
+                offsets.get("from") if "from" in offsets else s.get("start", 0) * 1000
+            )
+            end_ms = int(
+                offsets.get("to") if "to" in offsets else s.get("end", 0) * 1000
+            )
             text = (s.get("text") or "").strip()
             if not text:
                 continue
-            out.append(WhisperSegment(
-                start_ms=start_ms,
-                end_ms=end_ms,
-                text=text,
-                no_speech_prob=s.get("no_speech_prob"),
-                avg_logprob=s.get("avg_logprob"),
-            ))
+            out.append(
+                WhisperSegment(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    text=text,
+                    no_speech_prob=s.get("no_speech_prob"),
+                    avg_logprob=s.get("avg_logprob"),
+                )
+            )
         return out
 
 

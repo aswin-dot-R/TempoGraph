@@ -1,6 +1,6 @@
 """Top-level package for TempoGraph v2."""
 
-from . import models, json_parser
+from . import models, json_parser, settings
 
 try:
     from . import (

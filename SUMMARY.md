@@ -395,3 +395,32 @@ fixture bugs, ms-vs-seconds assertion. Suite 196 → 206.
 ```
 $ pytest -q → 206 passed
 ```
+
+---
+
+## 2026-07-13 — Item 7.5 (UI facelift) + PS8 (hardening + packaging) gate-reviewed and merged
+
+Both executed by the Ornith lanes (35B impl, 9B tests/collateral) while
+Fable was between sessions; gate review by Fable. Suite 213 passed.
+
+**7.5 UI facelift:** ui/theme.py + .streamlit/config.toml dark-first
+theme, wordmark/tagline, hero drop zone, metric cards, styled stage
+checklist.
+
+**PS8a hardening:** src/settings.py (TEMPOGRAPH_* env vars, expanduser),
+threaded through pipeline/aggregator/summarizer/UI; requirements fixed.
+Gate-review fixes by Fable: five remaining hardcoded /home/ashie paths
+(whisper_cpp defaults, pipeline fallback + CLI help, Ethogram
+placeholder) now flow from get_settings(); path audit = 0 hits.
+
+**PS8b packaging:** MIT LICENSE, GIF-first README (tagline + comparison
+table + quickstart + output contract + env config), docs/HARDWARE.md,
+Dockerfile (+.dockerignore, external-VLM pattern), CI workflow
+(yaml-valid), tests/test_settings.py.
+
+```
+$ pytest -q → 213 passed
+$ grep -rn "home/ashie" src/ ui/ --include=*.py | grep -v settings.py | wc -l → 0
+$ streamlit headless boot → UI_BOOTS
+$ ci.yml → yaml-valid
+```

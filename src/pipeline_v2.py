@@ -33,6 +33,7 @@ from src.modules.detector import ObjectDetector
 from src.modules.dense_captioner import run_dense_captioning
 from src.modules.frame_scorer import FrameScorer
 from src.modules.frame_selector import FrameSelector
+from src.settings import get_settings
 from src.modules.whisper_cpp import (
     WhisperCppTranscriber,
     write_segments_to_db,
@@ -288,10 +289,7 @@ class PipelineV2:
                 else:
                     t0 = time.time()
                     try:
-                        binary = (
-                            self.whisper_binary
-                            or "/home/ashie/whisper.cpp/build/bin/whisper-cli"
-                        )
+                        binary = self.whisper_binary or get_settings().whisper_binary
                         transcriber = WhisperCppTranscriber(
                             binary=binary,
                             model=self.whisper_model,
@@ -1035,7 +1033,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--whisper-binary",
         default=None,
-        help="Path to whisper-cli binary (default: /home/ashie/whisper.cpp/build/bin/whisper-cli)",
+        help="Path to whisper-cli binary (default: TEMPOGRAPH_WHISPER_BIN or ~/whisper.cpp/build/bin/whisper-cli)",
     )
     parser.add_argument(
         "--whisper-gpu-device",
