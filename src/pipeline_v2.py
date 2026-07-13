@@ -401,20 +401,32 @@ class PipelineV2:
                             cancel_event=self._cancel_event,
                             concurrency=self.walker_concurrency,
                         )
-                        captioned = counts.get("walker", {}).get("captioned", 0)
-                        escalated = counts.get("walker", {}).get("escalated", 0)
-                        self._stage(
-                            "Dense captions",
-                            "done",
-                            elapsed_s=round(time.time() - t0, 2),
-                            captioned=captioned,
-                            escalated=escalated,
-                        )
-                        db.mark_stage_complete(
-                            "Dense captions",
-                            elapsed_s=round(time.time() - t0, 2),
-                            n_units=captioned,
-                        )
+                        walker_counts = counts.get("walker", {})
+                        captioned = walker_counts.get("captioned", 0)
+                        skipped = walker_counts.get("skipped", 0)
+                        escalated = walker_counts.get("escalated", 0)
+                        errors = walker_counts.get("errors", 0)
+                        if captioned + skipped == 0 and errors > 0:
+                            # Every frame failed (e.g. VLM server down):
+                            # do NOT mark complete, so resume retries.
+                            self._stage(
+                                "Dense captions",
+                                "error",
+                                error=f"all {errors} caption requests failed",
+                            )
+                        else:
+                            self._stage(
+                                "Dense captions",
+                                "done",
+                                elapsed_s=round(time.time() - t0, 2),
+                                captioned=captioned,
+                                escalated=escalated,
+                            )
+                            db.mark_stage_complete(
+                                "Dense captions",
+                                elapsed_s=round(time.time() - t0, 2),
+                                n_units=captioned,
+                            )
                     except Exception as e:
                         self.logger.warning(f"Dense captions failed: {e}")
                         self._stage("Dense captions", "error", error=str(e))
