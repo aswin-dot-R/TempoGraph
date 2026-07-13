@@ -197,6 +197,11 @@ class DenseCaptionWalker:
     concurrent verifier in PS3).  Never crashes on a single HTTP failure —
     logs and counts it, moves on.
 
+    Concurrency is resolved lazily at the start of :meth:`walk()` with
+    this precedence: explicit kwarg → ``TEMPOGRAPH_WALKER_CONCURRENCY``
+    env var → ``GET /props`` ``total_slots`` (clamped to ``[1, 64]``) →
+    ``get_settings().walker_concurrency`` (default 4).
+
     When ``concurrency > 1`` the walk runs in two phases:
       Phase 1 — parallel per-frame captions (no change line, no escalation).
       Phase 2 — sequential change-line + escalation pass.
@@ -236,10 +241,15 @@ class DenseCaptionWalker:
                 ``{frame_idx, done, total, escalated}``.
             cancel_event: If set, ``walk()`` stops cleanly after the
                 current frame.
-            concurrency: Number of parallel HTTP workers. ``None`` →
-                ``get_settings().walker_concurrency``. ``1`` → exact
-                current sequential behaviour (byte-for-byte same prompts
-                as today).
+            concurrency: Number of parallel HTTP workers. ``None`` means
+                the actual value is resolved lazily at the start of
+                :meth:`walk()` with this precedence: (1) the explicit
+                kwarg (if passed), (2) the
+                ``TEMPOGRAPH_WALKER_CONCURRENCY`` environment variable,
+                (3) the server's ``GET /props`` ``total_slots`` (clamped
+                to ``[1, 64]``), or (4) ``get_settings().walker_concurrency``
+                as the final fallback. ``1`` → exact current sequential
+                behaviour (byte-for-byte same prompts as today).
         """
         self.db_path = Path(db_path)
         self.base_url = base_url.rstrip("/")
@@ -252,16 +262,59 @@ class DenseCaptionWalker:
         self.on_progress = on_progress
         self.cancel_event = cancel_event
         self.logger = logging.getLogger(f"{__name__}.{type(self).__name__}")
-
-        if concurrency is None:
-            from src.settings import get_settings
-
-            self.concurrency = get_settings().walker_concurrency
-        else:
-            self.concurrency = int(concurrency)
+        self._explicit_concurrency = concurrency
+        self.concurrency: int = 1  # resolved at the start of walk()
         self._db_lock = threading.Lock()
 
     # ── public API ─────────────────────────────────────────────────
+
+    def _resolve_concurrency(self) -> int:
+        """Resolve the concurrency slot count with lazy precedence.
+
+        Called once at the start of :meth:`walk()`.  Resolution order:
+
+        1. Explicit ``concurrency`` kwarg passed to :meth:`__init__`
+           → ``int(it)``.
+        2. ``TEMPOGRAPH_WALKER_CONCURRENCY`` env var →
+           ``get_settings().walker_concurrency``.
+        3. Probe ``GET {base_url}/props`` →
+           ``max(1, min(int(total_slots), 64))``.
+        4. Any exception / missing or invalid ``total_slots`` →
+           ``get_settings().walker_concurrency`` (default 4).
+
+        Returns:
+            The resolved concurrency value.
+        """
+        import os
+
+        from src.settings import get_settings
+
+        # 1. Explicit kwarg wins unconditionally.
+        if self._explicit_concurrency is not None:
+            return int(self._explicit_concurrency)
+
+        # 2. Environment variable takes the next slot.
+        env_val = os.environ.get("TEMPOGRAPH_WALKER_CONCURRENCY")
+        if env_val is not None:
+            return get_settings().walker_concurrency
+
+        # 3. Probe the server for total_slots.
+        try:
+            resp = requests.get(f"{self.base_url}/props", timeout=3.0)
+            resp.raise_for_status()
+            body = resp.json()
+            total_slots = body.get("total_slots")
+            if total_slots is None:
+                raise KeyError("total_slots")
+            resolved = max(1, min(int(total_slots), 64))
+            self.logger.info(f"Auto-detected {resolved} server slots")
+            return resolved
+        except Exception as e:
+            self.logger.warning(
+                f"Could not probe walker server for slot count "
+                f"({e}); falling back to settings default."
+            )
+            return get_settings().walker_concurrency
 
     def walk(self) -> Dict[str, int]:
         """Caption every frame not yet in ``frame_captions``.
@@ -270,6 +323,7 @@ class DenseCaptionWalker:
             ``{"captioned": int, "escalated": int, "skipped": int,
             "errors": int}``.
         """
+        self.concurrency = self._resolve_concurrency()
         db = TempoGraphDB(self.db_path)
         try:
             return self._walk(db)
@@ -1144,6 +1198,11 @@ def run_dense_captioning(
 
     If the walker raises, ``walker_done`` is set anyway and the verifier
     thread is joined before re-raising.
+
+    The walker's ``concurrency`` value is resolved lazily at the start of
+    :meth:`DenseCaptionWalker.walk()` (explicit kwarg →
+    ``TEMPOGRAPH_WALKER_CONCURRENCY`` env → ``GET /props``
+    ``total_slots`` → ``get_settings().walker_concurrency``).
 
     Args:
         db_path: Path to the run's ``tempograph.db``.

@@ -14,7 +14,6 @@ from unittest.mock import patch, MagicMock
 import pytest
 import sqlite3
 
-
 # ── helpers ──────────────────────────────────────────────────────────
 
 
@@ -37,8 +36,7 @@ def _create_test_db(db_path: str, rows=None) -> Path:
     conn.execute("DROP TABLE IF EXISTS frame_captions")
     conn.execute("DROP TABLE IF EXISTS audio_segments")
 
-    conn.execute(
-        """
+    conn.execute("""
         CREATE TABLE frames (
             frame_idx INTEGER PRIMARY KEY,
             timestamp_ms INTEGER NOT NULL,
@@ -46,10 +44,8 @@ def _create_test_db(db_path: str, rows=None) -> Path:
             is_keyframe INTEGER NOT NULL,
             delta_score REAL NOT NULL
         )
-        """
-    )
-    conn.execute(
-        """
+        """)
+    conn.execute("""
         CREATE TABLE frame_captions (
             frame_idx INTEGER PRIMARY KEY,
             caption TEXT NOT NULL,
@@ -63,18 +59,15 @@ def _create_test_db(db_path: str, rows=None) -> Path:
             verified_at TEXT,
             prompt TEXT
         )
-        """
-    )
-    conn.execute(
-        """
+        """)
+    conn.execute("""
         CREATE TABLE audio_segments (
             segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
             start_ms INTEGER NOT NULL,
             end_ms INTEGER NOT NULL,
             text TEXT NOT NULL
         )
-        """
-    )
+        """)
 
     if rows:
         for row in rows:
@@ -176,7 +169,8 @@ class TestDenseCaptionWalkerParity:
         assert walker.temperature == 0.15
 
     def test_concurrency(self):
-        """``DenseCaptionWalker.concurrency`` must equal the kwarg."""
+        """``DenseCaptionWalker.concurrency`` must equal the kwarg
+        after ``_resolve_concurrency`` is called."""
         from src.modules.dense_captioner import DenseCaptionWalker
 
         walker = DenseCaptionWalker(
@@ -188,7 +182,7 @@ class TestDenseCaptionWalkerParity:
             request_timeout_s=30.0,
             concurrency=8,
         )
-        assert walker.concurrency == 8
+        assert walker._resolve_concurrency() == 8
 
     def test_request_timeout(self):
         """``DenseCaptionWalker.request_timeout_s`` must equal the kwarg."""
@@ -516,8 +510,7 @@ class TestDenseCaptionWalkerWalk:
 
         # Create database with frames and audio segments
         conn = sqlite3.connect(db_path)
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE frames (
                 frame_idx INTEGER PRIMARY KEY,
                 timestamp_ms INTEGER NOT NULL,
@@ -525,10 +518,8 @@ class TestDenseCaptionWalkerWalk:
                 is_keyframe INTEGER NOT NULL,
                 delta_score REAL NOT NULL
             )
-            """
-        )
-        conn.execute(
-            """
+            """)
+        conn.execute("""
             CREATE TABLE frame_captions (
                 frame_idx INTEGER PRIMARY KEY,
                 caption TEXT NOT NULL,
@@ -538,18 +529,15 @@ class TestDenseCaptionWalkerWalk:
                 created_at TEXT NOT NULL,
                 prompt TEXT
             )
-            """
-        )
-        conn.execute(
-            """
+            """)
+        conn.execute("""
             CREATE TABLE audio_segments (
                 segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 start_ms INTEGER NOT NULL,
                 end_ms INTEGER NOT NULL,
                 text TEXT NOT NULL
             )
-            """
-        )
+            """)
 
         # Insert a frame at timestamp 10000
         conn.execute("INSERT INTO frames VALUES (1, 10000, '/tmp/frame.jpg', 0, 0.1)")
@@ -621,8 +609,7 @@ class TestDenseCaptionWalkerWalk:
         conn.execute("DROP TABLE IF EXISTS frames")
         conn.execute("DROP TABLE IF EXISTS audio_segments")
 
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE frames (
                 frame_idx INTEGER PRIMARY KEY,
                 timestamp_ms INTEGER NOT NULL,
@@ -630,18 +617,15 @@ class TestDenseCaptionWalkerWalk:
                 is_keyframe INTEGER NOT NULL,
                 delta_score REAL NOT NULL
             )
-            """
-        )
-        conn.execute(
-            """
+            """)
+        conn.execute("""
             CREATE TABLE audio_segments (
                 segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 start_ms INTEGER NOT NULL,
                 end_ms INTEGER NOT NULL,
                 text TEXT NOT NULL
             )
-            """
-        )
+            """)
 
         # Insert a frame at timestamp 10000
         conn.execute("INSERT INTO frames VALUES (1, 10000, '/tmp/frame.jpg', 0, 0.1)")
@@ -679,3 +663,128 @@ class TestDenseCaptionWalkerWalk:
         assert any(seg["text"] == "segment C" for seg in segments)
 
         db.close()
+
+
+# ── TestDynamicSlots: concurrency resolution ──────────────────────────
+
+
+class TestDynamicSlots:
+    """Verify the lazy _resolve_concurrency() precedence."""
+
+    def test_probe_total_slots_50(self, tmp_path):
+        """Probe returns total_slots=50 → concurrency becomes 50."""
+        db_path = str(tmp_path / "test.db")
+        _create_test_db(
+            db_path, [{"frame_idx": 1, "image_path": "/tmp/f.jpg", "delta_score": 0.1}]
+        )
+
+        from src.modules.dense_captioner import DenseCaptionWalker
+
+        walker = DenseCaptionWalker(
+            db_path=db_path,
+            base_url="http://127.0.0.1:8085",
+            concurrency=None,
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"total_slots": 50}
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("requests.get", return_value=mock_resp) as mock_get:
+            result = walker._resolve_concurrency()
+
+        assert result == 50
+        mock_get.assert_called_once_with("http://127.0.0.1:8085/props", timeout=3.0)
+
+    def test_probe_total_slots_200_clamped(self, tmp_path):
+        """Probe returns total_slots=200 → clamped to 64."""
+        db_path = str(tmp_path / "test.db")
+        _create_test_db(
+            db_path, [{"frame_idx": 1, "image_path": "/tmp/f.jpg", "delta_score": 0.1}]
+        )
+
+        from src.modules.dense_captioner import DenseCaptionWalker
+
+        walker = DenseCaptionWalker(
+            db_path=db_path,
+            base_url="http://127.0.0.1:8085",
+            concurrency=None,
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"total_slots": 200}
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("requests.get", return_value=mock_resp) as mock_get:
+            result = walker._resolve_concurrency()
+
+        assert result == 64
+        mock_get.assert_called_once()
+
+    def test_probe_connection_error_falls_back(self, tmp_path):
+        """Probe raises ConnectionError → falls back to settings default 4."""
+        db_path = str(tmp_path / "test.db")
+        _create_test_db(
+            db_path, [{"frame_idx": 1, "image_path": "/tmp/f.jpg", "delta_score": 0.1}]
+        )
+
+        from src.modules.dense_captioner import DenseCaptionWalker
+        from src.settings import get_settings
+
+        walker = DenseCaptionWalker(
+            db_path=db_path,
+            base_url="http://127.0.0.1:8085",
+            concurrency=None,
+        )
+
+        with patch("requests.get", side_effect=ConnectionError("refused")) as mock_get:
+            result = walker._resolve_concurrency()
+
+        assert result == get_settings().walker_concurrency
+        assert result == 4
+        mock_get.assert_called_once()
+
+    def test_env_var_skips_probe(self, tmp_path, monkeypatch):
+        """TEMPOGRAPH_WALKER_CONCURRENCY env var → settings default 4,
+        and requests.get is NOT called."""
+        db_path = str(tmp_path / "test.db")
+        _create_test_db(
+            db_path, [{"frame_idx": 1, "image_path": "/tmp/f.jpg", "delta_score": 0.1}]
+        )
+
+        from src.modules.dense_captioner import DenseCaptionWalker
+
+        monkeypatch.setenv("TEMPOGRAPH_WALKER_CONCURRENCY", "7")
+
+        walker = DenseCaptionWalker(
+            db_path=db_path,
+            base_url="http://127.0.0.1:8085",
+            concurrency=None,
+        )
+
+        with patch("requests.get") as mock_get:
+            result = walker._resolve_concurrency()
+
+        assert result == 7
+        mock_get.assert_not_called()
+
+    def test_explicit_kwarg_skips_probe(self, tmp_path):
+        """Explicit concurrency=2 → 2, and requests.get is NOT called."""
+        db_path = str(tmp_path / "test.db")
+        _create_test_db(
+            db_path, [{"frame_idx": 1, "image_path": "/tmp/f.jpg", "delta_score": 0.1}]
+        )
+
+        from src.modules.dense_captioner import DenseCaptionWalker
+
+        walker = DenseCaptionWalker(
+            db_path=db_path,
+            base_url="http://127.0.0.1:8085",
+            concurrency=2,
+        )
+
+        with patch("requests.get") as mock_get:
+            result = walker._resolve_concurrency()
+
+        assert result == 2
+        mock_get.assert_not_called()
