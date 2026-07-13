@@ -40,6 +40,7 @@ from ui.video_player import (  # noqa: E402
     resolve_video as _resolve_video,
     render_player as _render_player,
 )
+from ui.theme import apply_theme  # noqa: E402
 
 
 # ─── data access ──────────────────────────────────────────────────────────────
@@ -1983,6 +1984,12 @@ def _render_player_slot(run_dir: Path, bundle: dict) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="TempoGraph results", layout="wide")
+    apply_theme()
+    st.markdown(
+        '<div class="tg-wordmark">TEMPOGRAPH</div>'
+        '<div class="tg-tagline">local video intelligence</div>',
+        unsafe_allow_html=True,
+    )
     st.title("TempoGraph v2 — Results browser")
 
     # Initialise click-to-play session state so the first button click works.

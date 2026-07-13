@@ -37,11 +37,15 @@ sys.path.insert(0, str(REPO_ROOT))
 
 # ─── data access ──────────────────────────────────────────────────
 
+
 def _list_runs() -> List[Path]:
     if not RESULTS_DIR.exists():
         return []
-    runs = [p for p in RESULTS_DIR.iterdir()
-            if p.is_dir() and (p / "tempograph.db").exists()]
+    runs = [
+        p
+        for p in RESULTS_DIR.iterdir()
+        if p.is_dir() and (p / "tempograph.db").exists()
+    ]
     return sorted(runs, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -186,11 +190,7 @@ def _call_vlm(
     )
     response.raise_for_status()
     result = response.json()
-    content = (
-        result.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
+    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
 
     # Parse JSON from response
     try:
@@ -199,13 +199,18 @@ def _call_vlm(
     except json.JSONDecodeError:
         # Try to extract JSON from markdown/text
         import re
+
         m = re.search(r"\{[^}]+\}", content)
         if m:
             try:
                 return json.loads(m.group())
             except json.JSONDecodeError:
                 pass
-    return {"behavior": "unknown", "confidence": 0.0, "note": f"unparseable: {content[:100]}"}
+    return {
+        "behavior": "unknown",
+        "confidence": 0.0,
+        "note": f"unparseable: {content[:100]}",
+    }
 
 
 def _format_previous_labels(labels: List[dict]) -> str:
@@ -278,10 +283,12 @@ def _run_ethogram_batch(
                 # Build multi-image payload
                 content_items: List[dict] = [{"type": "text", "text": prompt}]
                 for b64 in images_b64:
-                    content_items.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    })
+                    content_items.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                        }
+                    )
 
                 payload = {
                     "model": vlm_model,
@@ -309,6 +316,7 @@ def _run_ethogram_batch(
 
                 # Parse JSON array from response
                 import re
+
                 parsed = None
                 try:
                     parsed = json.loads(raw_content)
@@ -323,19 +331,29 @@ def _run_ethogram_batch(
                 if isinstance(parsed, list) and len(parsed) > 0:
                     labels = []
                     for item in parsed:
-                        fidx = int(item.get("frame", valid_indices[len(labels)]
-                                            if len(labels) < len(valid_indices)
-                                            else valid_indices[-1]))
+                        fidx = int(
+                            item.get(
+                                "frame",
+                                (
+                                    valid_indices[len(labels)]
+                                    if len(labels) < len(valid_indices)
+                                    else valid_indices[-1]
+                                ),
+                            )
+                        )
                         behavior = str(item.get("behavior", "unknown"))
                         if behavior not in behavior_classes:
-                            behavior = lower_map.get(behavior.lower(),
-                                                     behavior_classes[-1])
-                        labels.append({
-                            "frame_idx": fidx,
-                            "behavior": behavior,
-                            "confidence": float(item.get("confidence", 0)),
-                            "note": str(item.get("note", "")),
-                        })
+                            behavior = lower_map.get(
+                                behavior.lower(), behavior_classes[-1]
+                            )
+                        labels.append(
+                            {
+                                "frame_idx": fidx,
+                                "behavior": behavior,
+                                "confidence": float(item.get("confidence", 0)),
+                                "note": str(item.get("note", "")),
+                            }
+                        )
                     return {
                         "labels": labels,
                         "prompt_tokens": int(usage.get("prompt_tokens", 0)),
@@ -373,35 +391,56 @@ def _run_ethogram_batch(
             if behavior not in behavior_classes:
                 behavior = lower_map.get(behavior.lower(), behavior_classes[-1])
 
-            labels.append({
-                "frame_idx": fidx,
-                "behavior": behavior,
-                "confidence": float(result.get("confidence", 0)),
-                "note": str(result.get("note", "")),
-            })
+            labels.append(
+                {
+                    "frame_idx": fidx,
+                    "behavior": behavior,
+                    "confidence": float(result.get("confidence", 0)),
+                    "note": str(result.get("note", "")),
+                }
+            )
         except Exception as e:
-            labels.append({
-                "frame_idx": fidx,
-                "behavior": "error",
-                "confidence": 0.0,
-                "note": str(e)[:100],
-            })
+            labels.append(
+                {
+                    "frame_idx": fidx,
+                    "behavior": "error",
+                    "confidence": 0.0,
+                    "note": str(e)[:100],
+                }
+            )
 
-    return {"labels": labels, "prompt_tokens": total_prompt, "total_tokens": total_tokens}
+    return {
+        "labels": labels,
+        "prompt_tokens": total_prompt,
+        "total_tokens": total_tokens,
+    }
 
 
 # ─── visualisation ────────────────────────────────────────────────
 
 _BEHAVIOR_COLORS = [
-    "#42a5f5", "#66bb6a", "#ef5350", "#ffa726", "#ab47bc",
-    "#26c6da", "#ec407a", "#8d6e63", "#7e57c2", "#26a69a",
-    "#d4e157", "#78909c", "#ff7043", "#5c6bc0", "#29b6f6",
+    "#42a5f5",
+    "#66bb6a",
+    "#ef5350",
+    "#ffa726",
+    "#ab47bc",
+    "#26c6da",
+    "#ec407a",
+    "#8d6e63",
+    "#7e57c2",
+    "#26a69a",
+    "#d4e157",
+    "#78909c",
+    "#ff7043",
+    "#5c6bc0",
+    "#29b6f6",
 ]
 
 
 def _assign_colors(classes: List[str]) -> Dict[str, str]:
-    return {c: _BEHAVIOR_COLORS[i % len(_BEHAVIOR_COLORS)]
-            for i, c in enumerate(classes)}
+    return {
+        c: _BEHAVIOR_COLORS[i % len(_BEHAVIOR_COLORS)] for i, c in enumerate(classes)
+    }
 
 
 def _render_state_timeline(
@@ -427,13 +466,17 @@ def _render_state_timeline(
         ts = frame_ts.get(lab["frame_idx"], 0.0)
         if lab["behavior"] != current_behavior:
             if current_behavior is not None:
-                bouts.append({
-                    "behavior": current_behavior,
-                    "start": bout_start,
-                    "end": ts,
-                    "frames": i - bout_start_idx,
-                    "frame_indices": [l["frame_idx"] for l in sorted_labels[bout_start_idx:i]],
-                })
+                bouts.append(
+                    {
+                        "behavior": current_behavior,
+                        "start": bout_start,
+                        "end": ts,
+                        "frames": i - bout_start_idx,
+                        "frame_indices": [
+                            l["frame_idx"] for l in sorted_labels[bout_start_idx:i]
+                        ],
+                    }
+                )
             current_behavior = lab["behavior"]
             bout_start = ts
             bout_start_idx = i
@@ -441,13 +484,17 @@ def _render_state_timeline(
     # Close last bout
     if current_behavior is not None:
         last_ts = frame_ts.get(sorted_labels[-1]["frame_idx"], bout_start + 0.5)
-        bouts.append({
-            "behavior": current_behavior,
-            "start": bout_start,
-            "end": max(last_ts, bout_start + 0.1),
-            "frames": len(sorted_labels) - bout_start_idx,
-            "frame_indices": [l["frame_idx"] for l in sorted_labels[bout_start_idx:]],
-        })
+        bouts.append(
+            {
+                "behavior": current_behavior,
+                "start": bout_start,
+                "end": max(last_ts, bout_start + 0.1),
+                "frames": len(sorted_labels) - bout_start_idx,
+                "frame_indices": [
+                    l["frame_idx"] for l in sorted_labels[bout_start_idx:]
+                ],
+            }
+        )
 
     if not bouts:
         return
@@ -457,23 +504,25 @@ def _render_state_timeline(
         b_bouts = [b for b in bouts if b["behavior"] == behavior]
         if not b_bouts:
             continue
-        fig.add_trace(go.Bar(
-            name=behavior,
-            x=[b["end"] - b["start"] for b in b_bouts],
-            base=[b["start"] for b in b_bouts],
-            y=["subject"] * len(b_bouts),
-            orientation="h",
-            marker_color=color_map[behavior],
-            text=[f"{behavior} ({b['frames']}f)" for b in b_bouts],
-            textposition="inside",
-            customdata=[",".join(map(str, b["frame_indices"])) for b in b_bouts],
-            hovertemplate=(
-                "<b>%{text}</b><br>"
-                "start: %{base:.2f}s<br>"
-                "duration: %{x:.2f}s<br>"
-                "<extra></extra>"
-            ),
-        ))
+        fig.add_trace(
+            go.Bar(
+                name=behavior,
+                x=[b["end"] - b["start"] for b in b_bouts],
+                base=[b["start"] for b in b_bouts],
+                y=["subject"] * len(b_bouts),
+                orientation="h",
+                marker_color=color_map[behavior],
+                text=[f"{behavior} ({b['frames']}f)" for b in b_bouts],
+                textposition="inside",
+                customdata=[",".join(map(str, b["frame_indices"])) for b in b_bouts],
+                hovertemplate=(
+                    "<b>%{text}</b><br>"
+                    "start: %{base:.2f}s<br>"
+                    "duration: %{x:.2f}s<br>"
+                    "<extra></extra>"
+                ),
+            )
+        )
 
     fig.update_layout(
         barmode="stack",
@@ -495,9 +544,20 @@ def _render_state_timeline(
                 cdata = cdata[0]
             if cdata:
                 indices = [int(x) for x in str(cdata).split(",") if x]
-                _display_selected_frames(frames, labels, indices, title=f"Frames for {pt.get('text', 'Bout')}")
+                _display_selected_frames(
+                    frames,
+                    labels,
+                    indices,
+                    title=f"Frames for {pt.get('text', 'Bout')}",
+                )
 
-def _display_selected_frames(frames: List[dict], labels: List[dict], indices: List[int], title: str = "Selected Frames") -> None:
+
+def _display_selected_frames(
+    frames: List[dict],
+    labels: List[dict],
+    indices: List[int],
+    title: str = "Selected Frames",
+) -> None:
     if not indices:
         return
     st.markdown(f"**{title}**")
@@ -505,15 +565,18 @@ def _display_selected_frames(frames: List[dict], labels: List[dict], indices: Li
     if not valid:
         st.write("No images found.")
         return
-    
+
     behavior_map = {l["frame_idx"]: l["behavior"] for l in labels}
-    
+
     cols = st.columns(min(len(valid), 4))
     for i, f in enumerate(valid[:20]):
         with cols[i % len(cols)]:
             st.image(f["image_path"], use_container_width=True)
             beh = behavior_map.get(f["frame_idx"], "")
-            st.caption(f"Frame {f['frame_idx']} ({f['timestamp_ms']/1000:.2f}s)<br>**{beh}**", unsafe_allow_html=True)
+            st.caption(
+                f"Frame {f['frame_idx']} ({f['timestamp_ms']/1000:.2f}s)<br>**{beh}**",
+                unsafe_allow_html=True,
+            )
     if len(valid) > 20:
         st.caption(f"...and {len(valid)-20} more frames")
 
@@ -570,15 +633,17 @@ def _render_bout_analysis(
 
     rows = []
     for behavior, durations in sorted(bouts.items()):
-        rows.append({
-            "Behaviour": behavior,
-            "Bouts": len(durations),
-            "Total (s)": round(sum(durations), 2),
-            "Mean (s)": round(np.mean(durations), 2),
-            "Median (s)": round(np.median(durations), 2),
-            "Min (s)": round(min(durations), 2),
-            "Max (s)": round(max(durations), 2),
-        })
+        rows.append(
+            {
+                "Behaviour": behavior,
+                "Bouts": len(durations),
+                "Total (s)": round(sum(durations), 2),
+                "Mean (s)": round(np.mean(durations), 2),
+                "Median (s)": round(np.median(durations), 2),
+                "Min (s)": round(min(durations), 2),
+                "Max (s)": round(max(durations), 2),
+            }
+        )
 
     st.subheader("Bout analysis")
     st.dataframe(rows, use_container_width=True, hide_index=True)
@@ -603,7 +668,7 @@ def _render_transition_matrix(labels: List[dict], frames: List[dict]) -> None:
             idx_a = idx[a]
             idx_b = idx[b]
             matrix[idx_a][idx_b] += 1
-            trans_idx = str(sorted_labels[i+1]["frame_idx"])
+            trans_idx = str(sorted_labels[i + 1]["frame_idx"])
             if customdata[idx_a][idx_b]:
                 customdata[idx_a][idx_b] += "," + trans_idx
             else:
@@ -625,7 +690,7 @@ def _render_transition_matrix(labels: List[dict], frames: List[dict]) -> None:
     )
     fig.update_traces(customdata=customdata)
     selection = st.plotly_chart(fig, use_container_width=True, on_select="rerun")
-    
+
     if selection and selection.get("selection", {}).get("points"):
         pt = selection["selection"]["points"][0]
         if "customdata" in pt and pt["customdata"]:
@@ -637,10 +702,13 @@ def _render_transition_matrix(labels: List[dict], frames: List[dict]) -> None:
                 # The transition happens at the given frame index, let's show that frame + the one before it if we want, but just showing the transition frames is fine
                 from_b = pt.get("y", "Unknown")
                 to_b = pt.get("x", "Unknown")
-                _display_selected_frames(frames, labels, indices, title=f"Transitions: {from_b} → {to_b}")
+                _display_selected_frames(
+                    frames, labels, indices, title=f"Transitions: {from_b} → {to_b}"
+                )
 
 
 # ─── main page ────────────────────────────────────────────────────
+
 
 def main() -> None:
     st.set_page_config(page_title="TempoGraph Ethogram", layout="wide")
@@ -673,9 +741,9 @@ def main() -> None:
     if input_mode.startswith("Local"):
         local_path = st.text_input(
             "Path to video file",
-            placeholder="/home/ashie/videos/camera0_4k.mkv",
+            placeholder="/path/to/video.mp4",
             help="Absolute path on your filesystem. "
-                 "No RAM overhead — the file is read directly by OpenCV/FFmpeg.",
+            "No RAM overhead — the file is read directly by OpenCV/FFmpeg.",
         )
         if local_path and os.path.isfile(local_path):
             novel_video_name = os.path.basename(local_path)
@@ -688,8 +756,17 @@ def main() -> None:
                 if not os.path.exists(fixed):
                     with st.spinner(f"Remuxing {novel_video_name} → MP4..."):
                         _sp.run(
-                            ["ffmpeg", "-y", "-i", local_path,
-                             "-c", "copy", "-fflags", "+genpts", fixed],
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-i",
+                                local_path,
+                                "-c",
+                                "copy",
+                                "-fflags",
+                                "+genpts",
+                                fixed,
+                            ],
                             capture_output=True,
                         )
                 novel_video_path = fixed
@@ -710,8 +787,17 @@ def main() -> None:
                 raw_path = f.name
             fixed = raw_path + "_fixed.mp4"
             _sp.run(
-                ["ffmpeg", "-y", "-i", raw_path,
-                 "-c", "copy", "-fflags", "+genpts", fixed],
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    raw_path,
+                    "-c",
+                    "copy",
+                    "-fflags",
+                    "+genpts",
+                    fixed,
+                ],
                 capture_output=True,
             )
             novel_video_path = fixed
@@ -730,22 +816,34 @@ def main() -> None:
                         ["static", "moving", "auto"],
                         index=0,
                         help="static: fixed camera (pixel delta). "
-                             "moving: handheld/drone (motion-compensated). "
-                             "auto: detect from first 30 frames.",
+                        "moving: handheld/drone (motion-compensated). "
+                        "auto: detect from first 30 frames.",
                     )
                     pp_fps = st.slider(
-                        "Sample FPS", 0.5, 10.0, 1.0, 0.5,
+                        "Sample FPS",
+                        0.5,
+                        10.0,
+                        1.0,
+                        0.5,
                         help="How many frames per second to sample for YOLO. "
-                             "Higher = more frames but slower processing.",
+                        "Higher = more frames but slower processing.",
                     )
                 with pp_col2:
                     pp_threshold = st.slider(
-                        "Keyframe threshold (× σ)", 0.5, 3.0, 1.0, 0.1,
+                        "Keyframe threshold (× σ)",
+                        0.5,
+                        3.0,
+                        1.0,
+                        0.1,
                         help="Controls how sensitive keyframe detection is. "
-                             "Lower = more keyframes. Higher = only big changes.",
+                        "Lower = more keyframes. Higher = only big changes.",
                     )
                     pp_confidence = st.slider(
-                        "YOLO confidence", 0.1, 0.9, 0.5, 0.05,
+                        "YOLO confidence",
+                        0.1,
+                        0.9,
+                        0.5,
+                        0.05,
                         help="Minimum detection confidence for YOLO bounding boxes.",
                     )
                 with pp_col3:
@@ -763,11 +861,19 @@ def main() -> None:
                     )
 
             if st.button("⚙ Preprocess this video (extract frames + YOLO)"):
-                with st.status("Preprocessing novel video (frames + YOLO)...", expanded=True) as status:
+                with st.status(
+                    "Preprocessing novel video (frames + YOLO)...", expanded=True
+                ) as status:
                     stage_log = st.empty()
                     stage_state: dict = {"lines": []}
+
                     def _icon(event: str) -> str:
-                        return {"start": "▶", "done": "✓", "error": "✗", "skipped": "⏭"}.get(event, "·")
+                        return {
+                            "start": "▶",
+                            "done": "✓",
+                            "error": "✗",
+                            "skipped": "⏭",
+                        }.get(event, "·")
 
                     def _on_stage(name: str, event: str, info: dict) -> None:
                         suffix = ""
@@ -789,21 +895,34 @@ def main() -> None:
                                 )
                             else:
                                 detail = f"  ↳ {name}: {info}"
-                            if stage_state["lines"] and stage_state["lines"][-1].startswith("  ↳"):
+                            if stage_state["lines"] and stage_state["lines"][
+                                -1
+                            ].startswith("  ↳"):
                                 stage_state["lines"][-1] = detail
                             else:
                                 stage_state["lines"].append(detail)
-                            stage_log.code("\n".join(stage_state["lines"]), language="text")
+                            stage_log.code(
+                                "\n".join(stage_state["lines"]), language="text"
+                            )
                             return
                         if event in ("start", "done", "skipped", "error"):
-                            if stage_state["lines"] and stage_state["lines"][-1].startswith("  ↳"):
+                            if stage_state["lines"] and stage_state["lines"][
+                                -1
+                            ].startswith("  ↳"):
                                 stage_state["lines"].pop()
-                            stage_state["lines"].append(f"{_icon(event)} {name} — {event}{suffix}")
+                            stage_state["lines"].append(
+                                f"{_icon(event)} {name} — {event}{suffix}"
+                            )
                         status.update(label=f"{name} ({event})")
                         stage_log.code("\n".join(stage_state["lines"]), language="text")
 
                     from src.models import CameraMode
-                    camera_map = {"static": CameraMode.STATIC, "moving": CameraMode.MOVING, "auto": CameraMode.AUTO}
+
+                    camera_map = {
+                        "static": CameraMode.STATIC,
+                        "moving": CameraMode.MOVING,
+                        "auto": CameraMode.AUTO,
+                    }
 
                     config = PipelineConfig(
                         video_path=novel_video_path,
@@ -835,7 +954,9 @@ def main() -> None:
 
     runs = _list_runs()
     if not runs:
-        st.info(f"No runs found in `{RESULTS_DIR}`. Please provide a video above and preprocess it.")
+        st.info(
+            f"No runs found in `{RESULTS_DIR}`. Please provide a video above and preprocess it."
+        )
         return
 
     # Show all runs as cards
@@ -855,6 +976,7 @@ def main() -> None:
         try:
             mtime = run_path.stat().st_mtime
             from datetime import datetime
+
             time_str = datetime.fromtimestamp(mtime).strftime("%b %d, %H:%M")
         except Exception:
             time_str = ""
@@ -862,6 +984,7 @@ def main() -> None:
         n_fr = 0
         try:
             import sqlite3 as _sql
+
             with _sql.connect(str(run_path / "tempograph.db")) as _c:
                 _c.row_factory = _sql.Row
                 n_fr = _c.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
@@ -877,10 +1000,10 @@ def main() -> None:
                 f'<div style="background:{bg};border:{border};border-radius:10px;'
                 f'padding:12px;text-align:center;margin-bottom:6px">'
                 f'<div style="font-size:14px;font-weight:700;color:#e0e0e0">'
-                f'🎬 {name}{check}</div>'
+                f"🎬 {name}{check}</div>"
                 f'<div style="font-size:11px;color:#888;margin-top:4px">'
-                f'{n_fr} frames · {time_str}</div>'
-                f'</div>',
+                f"{n_fr} frames · {time_str}</div>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
             if st.button(
@@ -909,7 +1032,8 @@ def main() -> None:
     preview_path = _resolve(first_frame["image_path"])
     if preview_path.exists():
         st.image(
-            str(preview_path), width=320,
+            str(preview_path),
+            width=320,
             caption=f"Selected: {run_dir.name} — {len(frames)} frames",
         )
 
@@ -932,11 +1056,10 @@ def main() -> None:
         value="sit\nstand\nwalk\nsniff\nwait\nindication\nother",
         height=200,
         help="List every valid behaviour class the model should choose from. "
-             "One per line. The model will pick exactly one per frame.",
+        "One per line. The model will pick exactly one per frame.",
     )
     behavior_classes = [
-        b.strip() for b in behavior_input.strip().split("\n")
-        if b.strip()
+        b.strip() for b in behavior_input.strip().split("\n") if b.strip()
     ]
 
     context_notes = st.sidebar.text_area(
@@ -949,7 +1072,7 @@ def main() -> None:
         ),
         height=200,
         help="Tell the model about the setup — landmarks, equipment, "
-             "what specific behaviours look like. Be specific!",
+        "what specific behaviours look like. Be specific!",
     )
 
     profile_name = st.sidebar.text_input(
@@ -988,7 +1111,8 @@ def main() -> None:
     # ── existing results ──
     with _connect(run_dir) as conn:
         # Ensure ethogram tables exist (for older DBs)
-        conn.executescript("""
+        conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS ethogram_labels (
                 label_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 frame_idx INTEGER NOT NULL,
@@ -999,16 +1123,19 @@ def main() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_ethogram_frame ON ethogram_labels(frame_idx);
             CREATE INDEX IF NOT EXISTS idx_ethogram_profile ON ethogram_labels(profile_name);
-        """)
+        """
+        )
         existing = [
-            dict(r) for r in conn.execute(
+            dict(r)
+            for r in conn.execute(
                 "SELECT * FROM ethogram_labels WHERE profile_name = ? "
                 "ORDER BY frame_idx ASC",
                 (profile_name,),
             ).fetchall()
         ]
         profiles = [
-            r[0] for r in conn.execute(
+            r[0]
+            for r in conn.execute(
                 "SELECT DISTINCT profile_name FROM ethogram_labels"
             ).fetchall()
         ]
@@ -1056,23 +1183,33 @@ def main() -> None:
 
         # ── Check/start VLM service ──
         import requests as _req
+
         try:
             _req.get(f"{vlm_url}/v1/models", timeout=2)
         except Exception:
-            progress.progress(0.0, text="Starting VLM service (qwen35-turboquant.service)...")
+            progress.progress(
+                0.0, text="Starting VLM service (qwen35-turboquant.service)..."
+            )
             import subprocess
+
             try:
                 subprocess.run(
                     ["systemctl", "--user", "start", "qwen35-turboquant.service"],
-                    check=True, capture_output=True, timeout=15
+                    check=True,
+                    capture_output=True,
+                    timeout=15,
                 )
                 # Wait for it to become ready
                 ready = False
                 for _ in range(60):
                     import time
+
                     time.sleep(1.0)
                     try:
-                        if _req.get(f"{vlm_url}/v1/models", timeout=1).status_code == 200:
+                        if (
+                            _req.get(f"{vlm_url}/v1/models", timeout=1).status_code
+                            == 200
+                        ):
                             ready = True
                             break
                     except Exception:
@@ -1088,9 +1225,10 @@ def main() -> None:
         n_ctx = 100096
         try:
             props = _req.get(f"{vlm_url}/props", timeout=5).json()
-            n_ctx = int(
-                props.get("default_generation_settings", {}).get("n_ctx", 0)
-            ) or 100096
+            n_ctx = (
+                int(props.get("default_generation_settings", {}).get("n_ctx", 0))
+                or 100096
+            )
         except Exception:
             pass
 
@@ -1107,18 +1245,23 @@ def main() -> None:
         idx = 0
         while idx < len(target_indices):
             # Dynamic batch size based on remaining budget
-            prev_labels_text = _format_previous_labels(recent_labels[-MAX_CONTEXT_LABELS:])
+            prev_labels_text = _format_previous_labels(
+                recent_labels[-MAX_CONTEXT_LABELS:]
+            )
             prev_labels_tokens = max(50, len(prev_labels_text) // 3)
             available = budget - prompt_overhead - prev_labels_tokens
             batch_size = max(
-                1, min(8, available // max(1, est_tokens_per_image + completion_per_frame))
+                1,
+                min(
+                    8, available // max(1, est_tokens_per_image + completion_per_frame)
+                ),
             )
 
-            batch_indices = target_indices[idx: idx + batch_size]
+            batch_indices = target_indices[idx : idx + batch_size]
             progress.progress(
                 (idx + 1) / len(target_indices),
                 text=f"Batch starting at frame {batch_indices[0]} "
-                     f"({idx+1}/{len(target_indices)}, batch={len(batch_indices)})",
+                f"({idx+1}/{len(target_indices)}, batch={len(batch_indices)})",
             )
 
             batch_results = _run_ethogram_batch(
@@ -1137,7 +1280,8 @@ def main() -> None:
             if batch_results.get("prompt_tokens", 0) > 0 and len(batch_indices) > 0:
                 est_tokens_per_image = int(
                     0.3 * est_tokens_per_image
-                    + 0.7 * max(500, batch_results["prompt_tokens"] / len(batch_indices))
+                    + 0.7
+                    * max(500, batch_results["prompt_tokens"] / len(batch_indices))
                 )
             cumulative_tokens += batch_results.get("total_tokens", 0)
 
@@ -1151,9 +1295,13 @@ def main() -> None:
                         "INSERT INTO ethogram_labels "
                         "(frame_idx, behavior, confidence, note, profile_name) "
                         "VALUES (?, ?, ?, ?, ?)",
-                        (lab["frame_idx"], lab["behavior"],
-                         lab.get("confidence", 0), lab.get("note", ""),
-                         profile_name),
+                        (
+                            lab["frame_idx"],
+                            lab["behavior"],
+                            lab.get("confidence", 0),
+                            lab.get("note", ""),
+                            profile_name,
+                        ),
                     )
                     conn.commit()
 
@@ -1208,13 +1356,15 @@ def main() -> None:
     table_rows = []
     for lab in existing:
         ts = frame_ts.get(lab["frame_idx"], 0.0)
-        table_rows.append({
-            "frame": lab["frame_idx"],
-            "t (s)": round(ts, 2),
-            "behaviour": lab["behavior"],
-            "confidence": round(lab.get("confidence", 0) or 0, 2),
-            "note": lab.get("note", ""),
-        })
+        table_rows.append(
+            {
+                "frame": lab["frame_idx"],
+                "t (s)": round(ts, 2),
+                "behaviour": lab["behavior"],
+                "confidence": round(lab.get("confidence", 0) or 0, 2),
+                "note": lab.get("note", ""),
+            }
+        )
     st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
     # Export
@@ -1230,6 +1380,7 @@ def main() -> None:
     # CSV export
     import csv
     import io
+
     csv_buf = io.StringIO()
     if table_rows:
         writer = csv.DictWriter(csv_buf, fieldnames=table_rows[0].keys())

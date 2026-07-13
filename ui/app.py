@@ -19,6 +19,8 @@ from typing import Optional
 
 import streamlit as st
 
+from ui.theme import apply_theme  # noqa: E402
+
 # Ensure project root is on sys.path for src imports
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -63,6 +65,12 @@ DEFAULT_KNOBS = {
 
 def main():
     st.set_page_config(page_title="TempoGraph v2", layout="wide")
+    apply_theme()
+    st.markdown(
+        '<div class="tg-wordmark">TEMPOGRAPH</div>'
+        '<div class="tg-tagline">local video intelligence</div>',
+        unsafe_allow_html=True,
+    )
     st.title("TempoGraph v2")
 
     # ── Determine current screen ─────────────────────────────────────
@@ -83,11 +91,13 @@ def _render_landing_screen():
     st.sidebar.markdown("### Welcome")
     st.sidebar.caption("Drop a video or enter a file path to begin.")
 
-    # ── Drop zone ────────────────────────────────────────────────────
+    # ── Drop zone (hero) ───────────────────────────────────────────
     st.markdown(
-        "<div style='text-align:center;padding:30px 0;'>"
-        "<p style='color:#888;font-size:16px'>Drag &amp; drop a video file below</p>"
-        "</div>",
+        '<div class="tg-hero">'
+        '<div class="tg-dropzone">'
+        "<p style='color:#888;font-size:16px;margin-bottom:4px'>"
+        "Drop a video</p>"
+        "</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -137,6 +147,17 @@ def _render_landing_screen():
     except Exception as e:
         st.error(f"Failed to probe video: {e}")
         _render_recent_runs()
+
+
+def _metric_card(label: str, value: int) -> None:
+    """Render a single stat card for recent runs."""
+    st.markdown(
+        '<div class="tg-metric-card">'
+        f'<div class="tg-metric-value">{value}</div>'
+        f'<div class="tg-metric-label">{label}</div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _render_recent_runs():
@@ -190,15 +211,29 @@ def _render_recent_runs():
         return
 
     st.divider()
-    st.markdown("### Recent runs")
+    st.markdown(
+        '<div style="display:flex;align-items:baseline;gap:8px">'
+        '<span style="font-size:16px;font-weight:600;color:#E6EAEE">Recent runs</span>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
     for r in runs[:8]:
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Frames", r["n_frames"])
-        col2.metric("Detections", r["n_detections"])
-        col3.metric("Entities", r["n_entities"])
-        col4.metric("Events", r["n_events"])
-        col5.caption(r["mtime"])
+        st.markdown(
+            '<div style="display:grid;grid-template-columns:repeat(5,1fr) 120px;gap:10px;align-items:start">',
+            unsafe_allow_html=True,
+        )
+        _metric_card("Frames", r["n_frames"])
+        _metric_card("Detections", r["n_detections"])
+        _metric_card("Entities", r["n_entities"])
+        _metric_card("Events", r["n_events"])
+        st.markdown(
+            '<div class="tg-metric-card">'
+            f'<div class="tg-metric-label" style="color:#6a737a">{r["mtime"]}</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
         if st.button(
             f"Open: {r['name']}", key=f"open_run_{r['name']}", use_container_width=True
         ):
@@ -565,11 +600,22 @@ def _render_progress_screen():
     # Stage checklist
     st.divider()
     st.subheader("Stage status")
+    _glyph = {
+        "queued": '<span style="color:#6a737a">&#x25ce;</span>',
+        "running": '<span style="color:#3FBFB5">&#x25cf;</span>',
+        "done": '<span style="color:#34d399">&#x2714;</span>',
+        "error": '<span style="color:#f87171">&#x2715;</span>',
+    }
     for stage, status in stage_status.items():
-        icon = {"queued": "⬜", "running": "🔄", "done": "✅", "error": "❌"}.get(
-            status, "•"
+        glyph = _glyph.get(status, '<span style="color:#6a737a">•</span>')
+        st.markdown(
+            f'<div class="tg-stage">'
+            f"{glyph} "
+            f'<span class="tg-stage-name">{stage}</span> &mdash; '
+            f'<span style="color:#888">{status}</span>'
+            f"</div>",
+            unsafe_allow_html=True,
         )
-        st.markdown(f"{icon} **{stage}** — {status}")
 
     # Live counters
     c1, c2, c3 = st.columns(3)

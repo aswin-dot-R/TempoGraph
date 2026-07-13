@@ -1,5 +1,7 @@
-[server]
-# Upload limit for the browser-based uploader only.
-# For large files (> 2 GB), use the "Local file path" input instead —
-# it reads the file directly from disk with zero RAM overhead.
-maxUploadSize = 2000
+[theme]
+base = "dark"
+primaryColor = "#3FBFB5"
+backgroundColor = "#14181D"
+secondaryBackgroundColor = "#1C2229"
+textColor = "#E6EAEE"
+font = "sans serif"
