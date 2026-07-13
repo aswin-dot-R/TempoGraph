@@ -67,6 +67,7 @@ class PipelineV2:
         dense_captions: bool = False,
         walker_url: str = "http://127.0.0.1:8085",
         verifier_url: str = "http://127.0.0.1:8096",
+        walker_concurrency: Optional[int] = None,
         dynamic_chunking: bool = True,
         context_threshold: float = 0.80,
         audio_enabled: bool = False,
@@ -107,6 +108,7 @@ class PipelineV2:
         self.dense_captions = dense_captions
         self.walker_url = walker_url
         self.verifier_url = verifier_url
+        self.walker_concurrency = walker_concurrency
         self.dynamic_chunking = dynamic_chunking
         self.context_threshold = context_threshold
         self.audio_enabled = audio_enabled
@@ -397,6 +399,7 @@ class PipelineV2:
                                 "Dense captions", "progress", **info
                             ),
                             cancel_event=self._cancel_event,
+                            concurrency=self.walker_concurrency,
                         )
                         captioned = counts.get("walker", {}).get("captioned", 0)
                         escalated = counts.get("walker", {}).get("escalated", 0)

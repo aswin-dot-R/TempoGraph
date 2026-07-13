@@ -20,6 +20,7 @@ class Settings:
     whisper_binary: str = field(default="~/whisper.cpp/build/bin/whisper-cli")
     whisper_model_dir: str = field(default="~/whisper.cpp/models")
     results_dir: str = "results"
+    walker_concurrency: int = 4
 
     def __post_init__(self):
         if not self.walker_url:
@@ -35,11 +36,21 @@ class Settings:
         )
 
         vlm_url = os.environ.get("TEMPOGRAPH_VLM_URL", cls.vlm_url)
-        walker_url = os.environ.get("TEMPOGRAPH_WALKER_URL", cls.vlm_url)
+        walker_url = os.environ.get("TEMPOGRAPH_WALKER_URL", vlm_url)
         verifier_url = os.environ.get("TEMPOGRAPH_VERIFIER_URL", cls.verifier_url)
         whisper_binary_expanded = os.path.expanduser(whisper_binary)
         whisper_model_dir_expanded = os.path.expanduser(whisper_model_dir)
         results_dir = os.environ.get("TEMPOGRAPH_RESULTS_DIR", cls.results_dir)
+
+        # walker_concurrency: env val → int, fall back to 4 on invalid input
+        walker_conc_raw = os.environ.get("TEMPOGRAPH_WALKER_CONCURRENCY")
+        if walker_conc_raw is None:
+            walker_conc = cls.walker_concurrency
+        else:
+            try:
+                walker_conc = int(walker_conc_raw)
+            except (ValueError, TypeError):
+                walker_conc = cls.walker_concurrency
 
         return cls(
             vlm_url=vlm_url,
@@ -49,6 +60,7 @@ class Settings:
             whisper_binary=whisper_binary_expanded,
             whisper_model_dir=whisper_model_dir_expanded,
             results_dir=results_dir,
+            walker_concurrency=walker_conc,
         )
 
     def __repr__(self):
@@ -56,7 +68,8 @@ class Settings:
             f"Settings(vlm_url={self.vlm_url!r}, vlm_model={self.vlm_model!r}, "
             f"walker_url={self.walker_url!r}, verifier_url={self.verifier_url!r}, "
             f"whisper_binary={self.whisper_binary!r}, whisper_model_dir={self.whisper_model_dir!r}, "
-            f"results_dir={self.results_dir!r})"
+            f"results_dir={self.results_dir!r}, "
+            f"walker_concurrency={self.walker_concurrency!r})"
         )
 
 

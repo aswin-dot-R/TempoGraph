@@ -79,11 +79,9 @@ CREATE TABLE IF NOT EXISTS frame_captions (
     verifier_model TEXT,
     created_at TEXT NOT NULL,
     verified_at TEXT,
+    prompt TEXT,
     FOREIGN KEY (frame_idx) REFERENCES frames(frame_idx)
 );
-
-CREATE INDEX IF NOT EXISTS idx_fc_escalated
-    ON frame_captions(escalated, verifier_agrees);
 
 CREATE TABLE IF NOT EXISTS run_meta (
     key TEXT PRIMARY KEY,
@@ -91,12 +89,19 @@ CREATE TABLE IF NOT EXISTS run_meta (
 );
 """
 
+# Indexes that reference columns added by migration — run after _migrate()
+# so legacy tables have the column back-filled first.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_fc_escalated
+    ON frame_captions(escalated, verifier_agrees);
+"""
+
 
 class TempoGraphDB:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         # Two threads (9B walker, 35B verifier) write this DB concurrently
         # via separate connections — WAL avoids locked-error stalls.
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -104,6 +109,8 @@ class TempoGraphDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
         self._migrate()
+        # Indexes that depend on migrated columns.
+        self._conn.executescript(INDEXES)
         self._conn.commit()
 
     def _migrate(self) -> None:
@@ -116,6 +123,24 @@ class TempoGraphDB:
         cols = {row[1] for row in self._conn.execute("PRAGMA table_info(detections)")}
         if "mask_rle" not in cols:
             self._conn.execute("ALTER TABLE detections ADD COLUMN mask_rle TEXT")
+
+        fc_cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(frame_captions)")
+        }
+        if "prompt" not in fc_cols:
+            self._conn.execute("ALTER TABLE frame_captions ADD COLUMN prompt TEXT")
+        if "verifier_agrees" not in fc_cols:
+            self._conn.execute(
+                "ALTER TABLE frame_captions ADD COLUMN verifier_agrees INTEGER"
+            )
+        if "verifier_caption" not in fc_cols:
+            self._conn.execute(
+                "ALTER TABLE frame_captions ADD COLUMN verifier_caption TEXT"
+            )
+        if "verifier_model" not in fc_cols:
+            self._conn.execute(
+                "ALTER TABLE frame_captions ADD COLUMN verifier_model TEXT"
+            )
 
     def has_table(self, name: str) -> bool:
         cur = self._conn.execute(
@@ -349,12 +374,13 @@ class TempoGraphDB:
         change_line: Optional[str],
         walker_model: str,
         escalated: bool = False,
+        prompt: Optional[str] = None,
     ) -> None:
         """INSERT OR REPLACE one walker row; sets created_at. Commits."""
         self._conn.execute(
             "INSERT OR REPLACE INTO frame_captions "
-            "(frame_idx, caption, change_line, walker_model, escalated, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(frame_idx, caption, change_line, walker_model, escalated, created_at, prompt) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 frame_idx,
                 caption,
@@ -362,9 +388,51 @@ class TempoGraphDB:
                 walker_model,
                 int(escalated),
                 datetime.now(timezone.utc).isoformat(),
+                prompt,
             ),
         )
         self._conn.commit()
+
+    def update_caption_change(
+        self,
+        frame_idx: int,
+        change_line: Optional[str],
+        escalated: bool,
+    ) -> None:
+        """UPDATE change_line + escalated for an existing frame_captions row.
+        Commits.
+        """
+        self._conn.execute(
+            "UPDATE frame_captions "
+            "SET change_line = ?, escalated = ? "
+            "WHERE frame_idx = ?",
+            (change_line, int(escalated), frame_idx),
+        )
+        self._conn.commit()
+
+    def get_latest_frame_captions(self, limit: int = 5) -> list:
+        """Most recent walker rows, newest first, JOINed to frames so each
+        row also has image_path, timestamp_ms, delta_score."""
+        rows = self._conn.execute(
+            "SELECT fc.*, f.image_path, f.timestamp_ms, f.delta_score "
+            "FROM frame_captions fc "
+            "JOIN frames f ON f.frame_idx = fc.frame_idx "
+            "ORDER BY fc.created_at DESC "
+            "LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_audio_segments_overlapping(self, start_ms: int, end_ms: int) -> list:
+        """Segments where seg.start_ms < end_ms AND seg.end_ms > start_ms,
+        ordered by start_ms."""
+        rows = self._conn.execute(
+            "SELECT * FROM audio_segments "
+            "WHERE start_ms < ? AND end_ms > ? "
+            "ORDER BY start_ms ASC",
+            (end_ms, start_ms),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def fetch_unverified_escalations(self, limit: int = 8) -> list:
         """Rows (sqlite3.Row) WHERE escalated=1 AND verifier_agrees IS NULL,

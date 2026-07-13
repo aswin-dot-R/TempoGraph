@@ -17,6 +17,7 @@ import math
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -38,6 +39,17 @@ _FRAME_PROMPT = (
     '"keys and a phone on a black table, two dogs moving in the background").\n'
     "CHANGE: one short sentence on what changed since the previous frame, "
     'or "no change".\n'
+)
+
+# Parallel-safe variant of _FRAME_PROMPT (no "Previous frame:" line and
+# no CHANGE instruction). Used in phase 1 of the concurrent walk.
+_PARALLEL_FRAME_PROMPT = (
+    "You are watching a video one frame at a time.\n"
+    "Reply with EXACTLY one line and nothing else:\n"
+    "FRAME: one sentence naming the visible objects with their "
+    "colors/attributes, the surface or setting they are on, and anything "
+    "happening in the background (e.g. "
+    '"keys and a phone on a black table, two dogs moving in the background").\n'
 )
 
 
@@ -184,6 +196,13 @@ class DenseCaptionWalker:
     Opens its own :class:`src.storage.TempoGraphDB` (WAL handles the
     concurrent verifier in PS3).  Never crashes on a single HTTP failure —
     logs and counts it, moves on.
+
+    When ``concurrency > 1`` the walk runs in two phases:
+      Phase 1 — parallel per-frame captions (no change line, no escalation).
+      Phase 2 — sequential change-line + escalation pass.
+    When ``concurrency == 1`` the walk runs sequentially as before, but
+    every row still stores ``prompt`` so the exact rendered prompt is
+    persisted.
     """
 
     def __init__(
@@ -198,6 +217,7 @@ class DenseCaptionWalker:
         request_timeout_s: float = 120.0,
         on_progress: Optional[Callable[[dict], None]] = None,
         cancel_event: Optional[threading.Event] = None,
+        concurrency: Optional[int] = None,
     ):
         """
         Args:
@@ -216,6 +236,10 @@ class DenseCaptionWalker:
                 ``{frame_idx, done, total, escalated}``.
             cancel_event: If set, ``walk()`` stops cleanly after the
                 current frame.
+            concurrency: Number of parallel HTTP workers. ``None`` →
+                ``get_settings().walker_concurrency``. ``1`` → exact
+                current sequential behaviour (byte-for-byte same prompts
+                as today).
         """
         self.db_path = Path(db_path)
         self.base_url = base_url.rstrip("/")
@@ -228,6 +252,14 @@ class DenseCaptionWalker:
         self.on_progress = on_progress
         self.cancel_event = cancel_event
         self.logger = logging.getLogger(f"{__name__}.{type(self).__name__}")
+
+        if concurrency is None:
+            from src.settings import get_settings
+
+            self.concurrency = get_settings().walker_concurrency
+        else:
+            self.concurrency = int(concurrency)
+        self._db_lock = threading.Lock()
 
     # ── public API ─────────────────────────────────────────────────
 
@@ -264,7 +296,10 @@ class DenseCaptionWalker:
             delta_threshold = max(raw_scores) if raw_scores else 0.0
         else:
             delta_threshold = _percentile(raw_scores, self.escalation_percentile)
-        self.logger.info(f"Walk: {total} frames, delta_threshold={delta_threshold:.4f}")
+        self.logger.info(
+            f"Walk: {total} frames, delta_threshold={delta_threshold:.4f}, "
+            f"concurrency={self.concurrency}"
+        )
 
         # Set of already-captioned frame indices (for resume).
         existing = {
@@ -274,6 +309,38 @@ class DenseCaptionWalker:
             ).fetchall()
         }
 
+        if self.concurrency == 1:
+            captioned, escalated, skipped, errors = self._walk_sequential(
+                db, frame_indices, total, existing, delta_threshold
+            )
+        else:
+            captioned, escalated, skipped, errors = self._walk_parallel(
+                db, frame_indices, total, existing, delta_threshold
+            )
+
+        self.logger.info(
+            f"Walk complete: captioned={captioned}, escalated={escalated}, "
+            f"skipped={skipped}, errors={errors}"
+        )
+        return {
+            "captioned": captioned,
+            "escalated": escalated,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    # ── sequential walk (concurrency == 1) ─────────────────────────
+
+    def _walk_sequential(
+        self,
+        db: TempoGraphDB,
+        frame_indices: List[int],
+        total: int,
+        existing: set,
+        delta_threshold: float,
+    ) -> Tuple[int, int, int, int]:
+        """Single-threaded walk — byte-for-byte same prompts as today,
+        plus persisting ``prompt`` on every row."""
         captioned = 0
         escalated = 0
         skipped = 0
@@ -290,8 +357,6 @@ class DenseCaptionWalker:
             # Resume: skip already-captioned frames.
             if frame_idx in existing:
                 skipped += 1
-                # Still need prev_caption for prompt continuity even on
-                # skipped frames — read it from the DB.
                 row = db.get_frame_caption(frame_idx)
                 if row and row.get("caption"):
                     prev_caption = row["caption"]
@@ -303,6 +368,7 @@ class DenseCaptionWalker:
                                 "done": captioned + skipped,
                                 "total": total,
                                 "escalated": escalated,
+                                "phase": 1,
                             }
                         )
                     except Exception:
@@ -324,6 +390,7 @@ class DenseCaptionWalker:
                                 "done": captioned + skipped,
                                 "total": total,
                                 "escalated": escalated,
+                                "phase": 1,
                             }
                         )
                     except Exception:
@@ -341,55 +408,12 @@ class DenseCaptionWalker:
             prev = prev_caption if prev_caption is not None else "(first frame)"
             prompt = _FRAME_PROMPT.format(prev_caption=prev)
 
-            payload = {
-                "model": self.model_name,
-                "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
-                "stream": False,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                            },
-                        ],
-                    }
-                ],
-            }
+            payload = self._build_payload(prompt, b64)
 
             # HTTP call — never crash the walk on failure.
-            try:
-                resp = requests.post(
-                    f"{self.base_url}/v1/chat/completions",
-                    json=payload,
-                    timeout=self.request_timeout_s,
-                )
-                resp.raise_for_status()
-                raw = resp.json()
-                reply = (
-                    raw.get("choices", [{}])[0].get("message", {}).get("content", "")
-                )
-            except Exception as e:
-                self.logger.error(f"Frame {frame_idx} HTTP failed: {e}")
+            reply = self._safe_post(payload, frame_idx)
+            if reply is None:
                 errors += 1
-                if self.on_progress is not None:
-                    try:
-                        self.on_progress(
-                            {
-                                "frame_idx": frame_idx,
-                                "done": captioned + skipped,
-                                "total": total,
-                                "escalated": escalated,
-                            }
-                        )
-                    except Exception:
-                        pass
-                # On error: no caption to store, prev stays as-is so the
-                # next frame's prompt still has *something*.
                 continue
 
             caption, change_line = parse_two_lines(reply)
@@ -406,6 +430,7 @@ class DenseCaptionWalker:
                 change_line=change_line,
                 walker_model=self.model_name,
                 escalated=escalated_flag,
+                prompt=prompt,
             )
             captioned += 1
             if escalated_flag:
@@ -426,21 +451,269 @@ class DenseCaptionWalker:
                             "done": captioned + skipped,
                             "total": total,
                             "escalated": escalated,
+                            "phase": 1,
                         }
                     )
                 except Exception:
                     pass
 
-        self.logger.info(
-            f"Walk complete: captioned={captioned}, escalated={escalated}, "
-            f"skipped={skipped}, errors={errors}"
+        return captioned, escalated, skipped, errors
+
+    # ── parallel walk (concurrency > 1) ──────────────────────────
+
+    def _walk_parallel(
+        self,
+        db: TempoGraphDB,
+        frame_indices: List[int],
+        total: int,
+        existing: set,
+        delta_threshold: float,
+    ) -> Tuple[int, int, int, int]:
+        """Two-phase parallel walk. Phase 1: parallel per-frame captions.
+        Phase 2: change lines + escalation in frame_idx order."""
+        skipped = len(existing)
+        to_caption = [fi for fi in frame_indices if fi not in existing]
+        captioned = 0
+        escalated = 0
+        errors = 0
+
+        # Pre-load frames so workers don't fight the DB.
+        frame_cache: Dict[int, dict] = {}
+        for fi in to_caption:
+            frame = db.get_frame(fi)
+            if frame:
+                frame_cache[fi] = frame
+            else:
+                self.logger.warning(f"Frame {fi} disappeared between query and read.")
+
+        def _caption_one(fi: int) -> Optional[str]:
+            """Worker: submit one frame to the walker server."""
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                return None
+            frame = frame_cache.get(fi)
+            if not frame:
+                return None
+            try:
+                b64 = self._encode_image(Path(frame["image_path"]))
+            except OSError as e:
+                self.logger.error(f"Frame {fi} image unreadable: {e}")
+                return None
+            prompt = _PARALLEL_FRAME_PROMPT
+            payload = self._build_payload(prompt, b64)
+            reply = self._safe_post(payload, fi)
+            if reply is None:
+                return None
+            caption, _change_line = parse_two_lines(reply)
+            with self._db_lock:
+                db.insert_frame_caption(
+                    frame_idx=fi,
+                    caption=caption,
+                    change_line=None,
+                    walker_model=self.model_name,
+                    escalated=False,
+                    prompt=prompt,
+                )
+            return caption
+
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            futures = {pool.submit(_caption_one, fi): fi for fi in to_caption}
+            for future in as_completed(futures):
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    future.cancel()
+                    continue
+                try:
+                    caption = future.result()
+                except Exception as e:
+                    self.logger.error(f"Future failed: {e}")
+                    errors += 1
+                    continue
+                if caption is not None:
+                    captioned += 1
+                else:
+                    errors += 1
+                if self.on_progress is not None:
+                    try:
+                        self.on_progress(
+                            {
+                                "frame_idx": futures[future],
+                                "done": captioned + skipped,
+                                "total": total,
+                                "escalated": escalated,
+                                "phase": 1,
+                            }
+                        )
+                    except Exception:
+                        pass
+
+        # Phase 2: change lines + escalation, in frame_idx order.
+        ph2_escalated, ph2_errors = self._phase2_change_lines(
+            db, frame_indices, total, delta_threshold
         )
+        escalated += ph2_escalated
+        errors += ph2_errors
+
+        return captioned, escalated, skipped, errors
+
+    def _phase2_change_lines(
+        self,
+        db: TempoGraphDB,
+        frame_indices: List[int],
+        total: int,
+        delta_threshold: float,
+    ) -> Tuple[int, int]:
+        """Walk frame_idx order; for each consecutive pair issue one
+        text-only CHANGE request. HTTP failure → change_line=None,
+        escalation from delta + jaccard only."""
+        escalated = 0
+        errors = 0
+        prev_caption: Optional[str] = None
+
+        for frame_idx in frame_indices:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                self.logger.info(
+                    f"Cancel requested during phase 2 after {escalated} escalated."
+                )
+                break
+
+            row = db.get_frame_caption(frame_idx)
+            if not row or not row.get("caption"):
+                # Resume: skip frames already in DB from a prior run,
+                # but still track prev_caption for continuity.
+                if row and row.get("caption"):
+                    prev_caption = row["caption"]
+                continue
+
+            caption = row["caption"]
+            frame = db.get_frame(frame_idx)
+            delta_score = frame["delta_score"] if frame else 0.0
+
+            if prev_caption is None:
+                # First frame: no change line, delta-only escalation.
+                change_line: Optional[str] = None
+                escalated_flag = should_escalate(
+                    delta_score=delta_score,
+                    delta_threshold=delta_threshold,
+                    caption=caption,
+                    prev_caption=None,
+                    similarity_floor=self.caption_similarity_floor,
+                )
+            else:
+                # One text-only request for the pair.
+                change_text_prompt = (
+                    "Compare these two consecutive frame captions.\n"
+                    "Caption N-1: {prev}\n"
+                    "Caption N: {curr}\n"
+                    "Reply with EXACTLY one line:\n"
+                    'CHANGE: <one short sentence> or "CHANGE: no change".\n'
+                ).format(prev=prev_caption, curr=caption)
+                payload = {
+                    "model": self.model_name,
+                    "max_tokens": 48,
+                    "temperature": self.temperature,
+                    "stream": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": change_text_prompt},
+                            ],
+                        }
+                    ],
+                }
+                reply = self._safe_post(payload, frame_idx)
+                if reply is None:
+                    # HTTP failure → change_line=None, escalation from
+                    # delta + jaccard only (never lose the caption).
+                    change_line = None
+                    escalated_flag = should_escalate(
+                        delta_score=delta_score,
+                        delta_threshold=delta_threshold,
+                        caption=caption,
+                        prev_caption=prev_caption,
+                        similarity_floor=self.caption_similarity_floor,
+                    )
+                    errors += 1
+                else:
+                    _, raw_change = parse_two_lines(reply)
+                    change_line = raw_change
+                    escalated_flag = should_escalate(
+                        delta_score=delta_score,
+                        delta_threshold=delta_threshold,
+                        caption=caption,
+                        prev_caption=prev_caption,
+                        similarity_floor=self.caption_similarity_floor,
+                    )
+
+            db.update_caption_change(
+                frame_idx=frame_idx,
+                change_line=change_line,
+                escalated=escalated_flag,
+            )
+            if escalated_flag:
+                escalated += 1
+                self.logger.debug(
+                    f"Frame {frame_idx} escalated "
+                    f"(delta={delta_score:.4f}, "
+                    f"threshold={delta_threshold:.4f})"
+                )
+
+            if self.on_progress is not None:
+                try:
+                    self.on_progress(
+                        {
+                            "frame_idx": frame_idx,
+                            "done": frame_idx + 1,
+                            "total": total,
+                            "escalated": escalated,
+                            "phase": 2,
+                        }
+                    )
+                except Exception:
+                    pass
+
+            prev_caption = caption
+
+        return escalated, errors
+
+    # ── shared helpers ─────────────────────────────────────────────
+
+    def _build_payload(self, prompt: str, b64: str) -> dict:
         return {
-            "captioned": captioned,
-            "escalated": escalated,
-            "skipped": skipped,
-            "errors": errors,
+            "model": self.model_name,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                        },
+                    ],
+                }
+            ],
         }
+
+    def _safe_post(self, payload: dict, frame_idx: int) -> Optional[str]:
+        """POST to the walker server. Returns reply content or None on
+        failure (logged)."""
+        try:
+            resp = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                timeout=self.request_timeout_s,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+            return raw.get("choices", [{}])[0].get("message", {}).get("content", "")
+        except Exception as e:
+            self.logger.error(f"Frame {frame_idx} HTTP failed: {e}")
+            return None
 
     # ── helpers ────────────────────────────────────────────────────
 
@@ -758,6 +1031,23 @@ class EscalationVerifier:
         change_line = row["change_line"] or ""
         prompt = _VERDICT_PROMPT.format(caption=caption, change_line=change_line)
 
+        # PS9a: transcript-aware verifier — look up audio segments
+        # overlapping ±5 s around this frame and append them to the prompt.
+        try:
+            ts_ms = current_frame.get("timestamp_ms")
+            if ts_ms is not None:
+                segments = db.get_audio_segments_overlapping(
+                    start_ms=ts_ms - 5000, end_ms=ts_ms + 5000
+                )
+                if segments:
+                    audio_lines = ["Spoken audio around this moment (+-5 s):"]
+                    for seg in segments[:6]:
+                        t_sec = seg["start_ms"] / 1000.0
+                        audio_lines.append(f'"{seg["text"]}" (t={t_sec:.1f}s)')
+                    prompt = prompt + "\n" + "\n".join(audio_lines) + "\n"
+        except Exception:
+            pass  # no audio stage / missing columns → prompt unchanged
+
         # Build content list: text + optional prev image + current image.
         content: list = [{"type": "text", "text": prompt}]
         if prev_b64 is not None:
@@ -862,7 +1152,9 @@ def run_dense_captioning(
         on_progress: Callback for progress events.
         cancel_event: If set, stops both threads.
         **kwargs: Forwarded to both :class:`DenseCaptionWalker` and
-            :class:`EscalationVerifier` constructors.
+            :class:`EscalationVerifier` constructors.  ``concurrency`` is
+            a walker-only kwarg and is *not* stripped — it is forwarded to
+            :class:`DenseCaptionWalker` directly.
 
     Returns:
         ``{"walker": <walker counts>, "verifier": <verifier counts>}``.
@@ -888,6 +1180,7 @@ def run_dense_captioning(
         "walker_done",  # not a real kwarg but kept for clarity
     }
     verifier_kwargs = {k: v for k, v in kwargs.items() if k in _VERIFIER_ONLY}
+    # ``concurrency`` is walker-only; everything else goes to the walker.
     walker_kwargs = {k: v for k, v in kwargs.items() if k not in _VERIFIER_ONLY}
 
     # ── progress forwarder (adds "who" key) ──────────────────────

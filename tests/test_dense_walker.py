@@ -252,6 +252,7 @@ class TestFullWalk:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("requests.post", _mock_post)
             walker = DenseCaptionWalker(
+                concurrency=1,
                 db_path=tmp_path / "t.db",
                 base_url="http://127.0.0.1:8085",
             )
@@ -296,6 +297,7 @@ class TestFullWalk:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("requests.post", _mock_post)
             walker = DenseCaptionWalker(
+                concurrency=1,
                 db_path=tmp_path / "t.db",
                 base_url="http://127.0.0.1:8085",
             )
@@ -332,6 +334,7 @@ class TestResume:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("requests.post", _mock_post)
             walker = DenseCaptionWalker(
+                concurrency=1,
                 db_path=tmp_path / "t.db",
                 base_url="http://127.0.0.1:8085",
             )
@@ -375,6 +378,7 @@ class TestCancel:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("requests.post", _mock_post)
             walker = DenseCaptionWalker(
+                concurrency=1,
                 db_path=tmp_path / "t.db",
                 base_url="http://127.0.0.1:8085",
                 cancel_event=cancel_event,
@@ -422,6 +426,7 @@ class TestHTTPError:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("requests.post", _mock_post_with_error)
             walker = DenseCaptionWalker(
+                concurrency=1,
                 db_path=tmp_path / "t.db",
                 base_url="http://127.0.0.1:8085",
             )

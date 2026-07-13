@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,8 @@ from src.auto_profile import VideoFacts, DerivedPlan, derive_plan, probe  # noqa
 from src.models import CameraMode, PipelineConfig  # noqa: E402
 from src.pipeline_v2 import PipelineV2  # noqa: E402
 from src.runtime_estimator import estimate_run, format_seconds  # noqa: E402
+
+from ui.live_view import render_live_view  # noqa: E402
 
 # ── state keys ───────────────────────────────────────────────────────
 KEY_VIDEO = "tg_video_path"
@@ -506,6 +509,15 @@ def _render_progress_screen():
         "Aggregation": "queued",
     }
 
+    # Live dense-caption view — repainted from the pipeline's progress
+    # callback: a run_every fragment can't fire while pipe.run() blocks
+    # the script thread, but callback writes into a container stream fine.
+    if overrides.get("dense_captions", True):
+        st.subheader("Live captioning")
+        stage_state["live_container"] = st.empty()
+        stage_state["live_db_path"] = Path(out_dir) / "tempograph.db"
+        stage_state["live_last_render"] = 0.0
+
     navigate_to_results = False
     with st.spinner("Running pipeline..."):
         try:
@@ -558,8 +570,6 @@ def _render_progress_screen():
 
             # Update final counts
             try:
-                import sqlite3
-
                 db_path = Path(out_dir) / "tempograph.db"
                 with sqlite3.connect(str(db_path)) as conn:
                     stage_state["counts"]["detections"] = conn.execute(
@@ -636,6 +646,22 @@ def _on_stage_progress(
         return  # handled separately to avoid flooding
 
     if name == "Aggregator call" and event == "done":
+        return
+
+    if name == "Dense captions" and event == "progress":
+        # Per-frame events: repaint the live view (throttled), skip the log.
+        container = stage_state.get("live_container")
+        now = time.time()
+        if (
+            container is not None
+            and now - stage_state.get("live_last_render", 0.0) >= 1.0
+        ):
+            stage_state["live_last_render"] = now
+            try:
+                with container.container():
+                    render_live_view(stage_state["live_db_path"])
+            except Exception:
+                pass
         return
 
     # Update stage status
