@@ -1130,6 +1130,117 @@ def _render_graph_tab(run_dir: Path, bundle: dict, analysis: Optional[dict]) -> 
     _render_clips_section(run_dir, analysis)
 
 
+def _render_highlight_reel_section(run_dir: Path, bundle: dict) -> None:
+    """Highlight reel: top-60s summary clip built from delta-scored frames."""
+    from src.highlight_reel import build_highlight_reel, pick_highlight_spans
+
+    st.subheader("Highlight Reel")
+    st.caption(
+        "Assemble the most interesting 60 seconds from this run — "
+        "frames are ranked by delta_score and stitched with crossfades."
+    )
+
+    existing_reel = run_dir / "highlight_reel.mp4"
+    if existing_reel.exists():
+        st.info(
+            f"Highlight reel already exists at `{existing_reel}`. "
+            "Adjust the duration below and click **Build reel** to rebuild."
+        )
+        st.video(str(existing_reel))
+        st.download_button(
+            "⬇ Download highlight reel",
+            data=existing_reel.read_bytes(),
+            file_name="highlight_reel.mp4",
+            mime="video/mp4",
+            key="reel_dl_existing",
+        )
+
+    c1, c2, c3 = st.columns([1, 1, 3])
+    reel_duration = c1.selectbox(
+        "Target duration",
+        [30, 60, 90],
+        index=1,
+        format_func=lambda s: f"{s} s",
+        key="reel_duration",
+    )
+    c2.caption(f"Min gap: 3 s · padding: 1.5 s")
+    if c3.button("Build reel", type="primary", key="reel_build"):
+        # Resolve the source video the same way the Clips section does.
+        src_path = None
+        try:
+            with _connect(run_dir) as conn:
+                row = conn.execute(
+                    "SELECT value FROM run_meta WHERE key = 'video_path'"
+                ).fetchone()
+            if row and Path(row["value"]).exists():
+                src_path = row["value"]
+        except sqlite3.OperationalError:
+            pass
+
+        if not src_path or not Path(src_path).exists():
+            st.info(
+                "Source video is not available — cannot build a highlight "
+                "reel. Make sure the original video path is stored in the "
+                "run metadata and the file exists on disk."
+            )
+            return
+
+        try:
+            db_path = run_dir / "tempograph.db"
+            spans = pick_highlight_spans(db_path, target_duration_s=reel_duration)
+            if not spans:
+                st.info("No spans could be selected (no frames in the database).")
+                return
+            out_path = run_dir / "highlight_reel.mp4"
+            with st.spinner(f"Cutting {len(spans)} span(s) with ffmpeg..."):
+                result = build_highlight_reel(
+                    Path(src_path), spans, out_path, fade_s=0.25
+                )
+            dur = _ffprobe_duration_safe(result)
+            st.success(
+                f"Built highlight reel → `{result}` " f"({dur:.1f}s)"
+                if dur
+                else f"Built → `{result}`"
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"Highlight reel build failed: {e}")
+
+    if existing_reel.exists():
+        st.download_button(
+            "⬇ Download highlight reel",
+            data=existing_reel.read_bytes(),
+            file_name="highlight_reel.mp4",
+            mime="video/mp4",
+            key="reel_dl",
+        )
+
+
+def _ffprobe_duration_safe(path: Path) -> Optional[float]:
+    """Thin wrapper around ffprobe with a fallback to None."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
 def _render_clips_section(run_dir: Path, analysis: Optional[dict]) -> None:
     """Clips: cut an mp4 of every event matching an entity and/or behavior."""
     from src.clip_export import export_clips, select_events
@@ -1933,6 +2044,8 @@ def main() -> None:
     with overview:
         _render_player_slot(run_dir, bundle)
         _render_summary(run_dir, analysis, bundle)
+        st.divider()
+        _render_highlight_reel_section(run_dir, bundle)
         st.divider()
         _render_entities_table(analysis)
         st.divider()

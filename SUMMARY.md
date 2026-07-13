@@ -379,3 +379,19 @@ str/str path bugs and key=None guards. Suite 182 → 196.
 $ pytest -q --ignore=tests/test_highlight_reel.py → 196 passed
 ```
 (highlight_reel tests excluded: 9B mid-write on PS7b at gate time)
+
+---
+
+## 2026-07-13 — PS7: highlight reel (parallel lanes, Fable-driven)
+
+35B: src/highlight_reel.py (greedy pick_highlight_spans by delta_score
+with min-gap + padding + merge; build_highlight_reel via ffmpeg with
+xfade, re-encode accuracy, single-span no-fade path, ValueError on empty
+spans) + Overview "Highlight Reel" card with cached-reel reuse. 9B: 10
+tests incl. hand-checked greedy math and ffprobe-verified integration.
+Gate seam-fix (35B): empty-spans ValueError ordering, tmp_path/dir
+fixture bugs, ms-vs-seconds assertion. Suite 196 → 206.
+
+```
+$ pytest -q → 206 passed
+```
