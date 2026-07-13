@@ -3,12 +3,54 @@
 import logging
 import sqlite3
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 
 from src.json_parser import JSONParser
 from src.models import AnalysisResult, ChunkCaption
+
+# Used when the server's context size cannot be probed.
+DEFAULT_N_CTX = 32768
+# Fraction of the context the prompt may occupy (the rest is the reply).
+PROMPT_CONTEXT_FRACTION = 0.7
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count for prompt budgeting (~3 chars per token)."""
+    return len(text) // 3
+
+
+def subsample_lines(lines: List[str], keep: int) -> List[str]:
+    """Thin ``lines`` down to about ``keep`` entries, evenly spaced.
+
+    The first and last lines are always kept so the timeline still spans
+    the whole video.
+    """
+    if keep >= len(lines) or keep <= 0:
+        return list(lines)
+    if keep == 1:
+        return [lines[0]]
+    step = len(lines) / float(keep - 1)
+    picked = {0, len(lines) - 1}
+    for i in range(1, keep - 1):
+        picked.add(min(len(lines) - 1, int(round(i * step))))
+    return [lines[i] for i in sorted(picked)]
+
+
+def truncate_middle(text: str, max_chars: int) -> str:
+    """Drop the middle of ``text``, keeping the head and tail."""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    marker = "\n[... trimmed to fit context ...]\n"
+    room = max(0, max_chars - len(marker))
+    head = room // 2
+    tail = room - head
+    if tail <= 0:
+        return text[:head]
+    return text[:head] + marker + text[-tail:]
 
 
 SINGLE_PASS_PROMPT = """You are given a chronological log of per-frame and per-chunk descriptions of a video, and (optionally) a speech transcript. Identify entities (people, animals, vehicles, objects), their behaviors and interactions over time, and produce structured JSON. If a transcript is provided, also populate audio_events and multimodal_correlations linking what is said to what is seen.
@@ -203,9 +245,89 @@ class CaptionAggregator:
             "\n".join(log_lines), transcript_text, dense_text=dense_text
         )
 
+    def get_n_ctx(self) -> int:
+        """Per-slot context size of the aggregation server.
+
+        Reads ``default_generation_settings.n_ctx`` from ``GET /props`` —
+        that is the *per-slot* size, which is what a single request has to
+        fit into.  Falls back to :data:`DEFAULT_N_CTX` when the server
+        cannot be probed.  Cached for the life of the aggregator.
+        """
+        cached = getattr(self, "_n_ctx", None)
+        if cached is not None:
+            return cached
+        n_ctx = DEFAULT_N_CTX
+        try:
+            resp = requests.get(f"{self.base_url}/props", timeout=3.0)
+            resp.raise_for_status()
+            probed = (resp.json().get("default_generation_settings") or {}).get("n_ctx")
+            if probed:
+                n_ctx = int(probed)
+        except Exception as e:
+            self.logger.warning(
+                f"could not probe /props for n_ctx ({e}); assuming {DEFAULT_N_CTX}"
+            )
+        self._n_ctx = n_ctx
+        return n_ctx
+
+    def _prompt_budget(self) -> int:
+        """Tokens the prompt may use, leaving room for the reply."""
+        n_ctx = self.get_n_ctx()
+        reply_room = n_ctx - self.max_tokens - 512  # 512 = template + slack
+        return max(1024, min(int(n_ctx * PROMPT_CONTEXT_FRACTION), reply_room))
+
+    def _fit_blocks(
+        self, captions_text: str, dense_text: str, transcript_text: str
+    ) -> Tuple[str, str, str]:
+        """Shrink the prompt blocks until they fit the server's context.
+
+        Order of sacrifice: the dense per-frame timeline is subsampled
+        first (it is the most redundant), then the transcript middle, then
+        the chunk captions.  Returns the possibly-shrunk blocks.
+        """
+        budget = self._prompt_budget()
+        overhead = estimate_tokens(SINGLE_PASS_PROMPT)
+
+        def total() -> int:
+            return (
+                overhead
+                + estimate_tokens(dense_text)
+                + estimate_tokens(captions_text)
+                + estimate_tokens(transcript_text)
+            )
+
+        original = total()
+
+        # 1. Subsample the dense timeline (never below 6 lines).
+        while dense_text and total() > budget:
+            lines = dense_text.splitlines()
+            if len(lines) <= 6:
+                break
+            dense_text = "\n".join(subsample_lines(lines, max(6, len(lines) // 2)))
+
+        # 2. Truncate the transcript middle.
+        if transcript_text and total() > budget:
+            keep = estimate_tokens(transcript_text) - (total() - budget)
+            transcript_text = truncate_middle(transcript_text, max(0, keep) * 3)
+
+        # 3. Last resort: truncate the captions themselves.
+        if total() > budget:
+            keep = estimate_tokens(captions_text) - (total() - budget)
+            captions_text = truncate_middle(captions_text, max(1, keep) * 3)
+
+        if total() < original:
+            self.logger.warning(
+                f"aggregation prompt trimmed {original} -> {total()} est. tokens "
+                f"to fit a {self.get_n_ctx()}-token context"
+            )
+        return captions_text, dense_text, transcript_text
+
     def _single_pass_from_text(
         self, captions_text: str, transcript_text: str = "", dense_text: str = ""
     ) -> AnalysisResult:
+        captions_text, dense_text, transcript_text = self._fit_blocks(
+            captions_text, dense_text, transcript_text
+        )
         if dense_text:
             captions_text = f"[dense captions]\n{dense_text}\n\n{captions_text}"
         prompt = SINGLE_PASS_PROMPT.format(

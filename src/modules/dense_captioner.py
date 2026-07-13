@@ -608,6 +608,30 @@ class DenseCaptionWalker:
 
         return captioned, escalated, skipped, errors
 
+    def _change_line_payload(self, prev_caption: str, caption: str) -> dict:
+        change_text_prompt = (
+            "Compare these two consecutive frame captions.\n"
+            "Caption N-1: {prev}\n"
+            "Caption N: {curr}\n"
+            "Reply with EXACTLY one line:\n"
+            'CHANGE: <one short sentence> or "CHANGE: no change".\n'
+        ).format(prev=prev_caption, curr=caption)
+        return {
+            "model": self.model_name,
+            "max_tokens": 48,
+            "temperature": self.temperature,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": change_text_prompt},
+                    ],
+                }
+            ],
+        }
+
     def _phase2_change_lines(
         self,
         db: TempoGraphDB,
@@ -615,93 +639,85 @@ class DenseCaptionWalker:
         total: int,
         delta_threshold: float,
     ) -> Tuple[int, int]:
-        """Walk frame_idx order; for each consecutive pair issue one
-        text-only CHANGE request. HTTP failure → change_line=None,
-        escalation from delta + jaccard only."""
-        escalated = 0
-        errors = 0
-        prev_caption: Optional[str] = None
+        """Change line + escalation for every captioned frame.
 
+        The consecutive-caption pairs are fixed up front (by frame_idx, not
+        by completion order), so the text-only CHANGE requests can be issued
+        concurrently on the same slots phase 1 used.  Verdicts are then
+        applied in frame_idx order, exactly as the sequential pass did.
+
+        HTTP failure → ``change_line=None`` and escalation from delta +
+        jaccard only, so a failed request never loses a caption.
+        """
+        # Ordered (frame_idx, caption, delta_score) for captioned frames.
+        ordered: List[Tuple[int, str, float]] = []
         for frame_idx in frame_indices:
+            row = db.get_frame_caption(frame_idx)
+            if not row or not row.get("caption"):
+                continue
+            frame = db.get_frame(frame_idx)
+            ordered.append(
+                (
+                    frame_idx,
+                    row["caption"],
+                    frame["delta_score"] if frame else 0.0,
+                )
+            )
+        if not ordered:
+            return 0, 0
+
+        def _change_for(i: int) -> Tuple[bool, Optional[str]]:
+            """Ask for the change line of pair (i-1, i). ``(ok, line)``."""
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                return True, None
+            frame_idx, caption, _ = ordered[i]
+            prev_caption = ordered[i - 1][1]
+            reply = self._safe_post(
+                self._change_line_payload(prev_caption, caption), frame_idx
+            )
+            if reply is None:
+                return False, None
+            _, raw_change = parse_two_lines(reply)
+            return True, raw_change
+
+        # Fetch every change line (frame 0 has no predecessor → no line).
+        change_lines: Dict[int, Optional[str]] = {0: None}
+        errors = 0
+        pending = range(1, len(ordered))
+        with ThreadPoolExecutor(max_workers=max(1, self.concurrency)) as pool:
+            futures = {pool.submit(_change_for, i): i for i in pending}
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    ok, line = future.result()
+                except Exception as e:
+                    self.logger.error(f"Phase 2 future failed: {e}")
+                    ok, line = False, None
+                if not ok:
+                    errors += 1
+                change_lines[i] = line
+
+        # Apply in frame_idx order: escalation depends on the previous
+        # caption, so the sequence stays deterministic.
+        escalated = 0
+        for i, (frame_idx, caption, delta_score) in enumerate(ordered):
             if self.cancel_event is not None and self.cancel_event.is_set():
                 self.logger.info(
                     f"Cancel requested during phase 2 after {escalated} escalated."
                 )
                 break
 
-            row = db.get_frame_caption(frame_idx)
-            if not row or not row.get("caption"):
-                # Resume: skip frames already in DB from a prior run,
-                # but still track prev_caption for continuity.
-                if row and row.get("caption"):
-                    prev_caption = row["caption"]
-                continue
-
-            caption = row["caption"]
-            frame = db.get_frame(frame_idx)
-            delta_score = frame["delta_score"] if frame else 0.0
-
-            if prev_caption is None:
-                # First frame: no change line, delta-only escalation.
-                change_line: Optional[str] = None
-                escalated_flag = should_escalate(
-                    delta_score=delta_score,
-                    delta_threshold=delta_threshold,
-                    caption=caption,
-                    prev_caption=None,
-                    similarity_floor=self.caption_similarity_floor,
-                )
-            else:
-                # One text-only request for the pair.
-                change_text_prompt = (
-                    "Compare these two consecutive frame captions.\n"
-                    "Caption N-1: {prev}\n"
-                    "Caption N: {curr}\n"
-                    "Reply with EXACTLY one line:\n"
-                    'CHANGE: <one short sentence> or "CHANGE: no change".\n'
-                ).format(prev=prev_caption, curr=caption)
-                payload = {
-                    "model": self.model_name,
-                    "max_tokens": 48,
-                    "temperature": self.temperature,
-                    "stream": False,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": change_text_prompt},
-                            ],
-                        }
-                    ],
-                }
-                reply = self._safe_post(payload, frame_idx)
-                if reply is None:
-                    # HTTP failure → change_line=None, escalation from
-                    # delta + jaccard only (never lose the caption).
-                    change_line = None
-                    escalated_flag = should_escalate(
-                        delta_score=delta_score,
-                        delta_threshold=delta_threshold,
-                        caption=caption,
-                        prev_caption=prev_caption,
-                        similarity_floor=self.caption_similarity_floor,
-                    )
-                    errors += 1
-                else:
-                    _, raw_change = parse_two_lines(reply)
-                    change_line = raw_change
-                    escalated_flag = should_escalate(
-                        delta_score=delta_score,
-                        delta_threshold=delta_threshold,
-                        caption=caption,
-                        prev_caption=prev_caption,
-                        similarity_floor=self.caption_similarity_floor,
-                    )
-
+            prev_caption = ordered[i - 1][1] if i > 0 else None
+            escalated_flag = should_escalate(
+                delta_score=delta_score,
+                delta_threshold=delta_threshold,
+                caption=caption,
+                prev_caption=prev_caption,
+                similarity_floor=self.caption_similarity_floor,
+            )
             db.update_caption_change(
                 frame_idx=frame_idx,
-                change_line=change_line,
+                change_line=change_lines.get(i),
                 escalated=escalated_flag,
             )
             if escalated_flag:
@@ -717,7 +733,7 @@ class DenseCaptionWalker:
                     self.on_progress(
                         {
                             "frame_idx": frame_idx,
-                            "done": frame_idx + 1,
+                            "done": i + 1,
                             "total": total,
                             "escalated": escalated,
                             "phase": 2,
@@ -725,8 +741,6 @@ class DenseCaptionWalker:
                     )
                 except Exception:
                     pass
-
-            prev_caption = caption
 
         return escalated, errors
 

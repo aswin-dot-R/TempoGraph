@@ -1061,6 +1061,11 @@ if __name__ == "__main__":
         default=None,
         help="Force language (e.g. 'en'); default = auto-detect",
     )
+    parser.add_argument(
+        "--dense-captions",
+        action="store_true",
+        help="Per-frame dense captioning (walker + escalation verifier)",
+    )
     args = parser.parse_args()
 
     config = PipelineConfig(
@@ -1099,6 +1104,7 @@ if __name__ == "__main__":
         whisper_binary=args.whisper_binary,
         whisper_gpu_device=args.whisper_gpu_device,
         whisper_language=args.whisper_language,
+        dense_captions=args.dense_captions,
     )
     result = pipe.run()
     print(f"Done in {result.processing_time:.1f}s -> {args.output}")
