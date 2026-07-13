@@ -31,6 +31,7 @@ States: `spec'd` → `in-progress` → `gate review (Fable)` → `merged`
 | 7 | Highlight reel (both lanes) | `ps7a.md` + `ps7b.md` | **merged** (2026-07-13) |
 | 7.5 | UI facelift — dark-first theme, hero, cards | `docs/ps/ps7-5.md` | **merged** (`acff9a4`, 2026-07-13) |
 | 8 | Ship hardening + packaging (both lanes) | `ps8a.md` + `ps8b.md` | **merged** (`840c682`, 2026-07-13) |
+| 9p | Parallel dense captioning + live view (both lanes) | `ps9a.md` + `ps9b.md` | **merged** (`44bc0ed`, 2026-07-13) |
 | 9 | **SHIP v1.0** — Fable-led release checklist: full suite + smoke on real footage, README GIF recorded by human, repo scrub (`results/`, `*.pt`, personal paths), squash-review of branch, merge to main, tag v1.0.0, push to public GitHub | (no PS — gate session) | **READY — needs human: demo GIF + GitHub remote** |
 
 Definition of shipped: a stranger with one GPU clones the repo, runs
