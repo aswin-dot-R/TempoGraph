@@ -15,12 +15,16 @@ VALID_JSON = """{
 
 def test_aggregator_single_pass_returns_analysis_result():
     chunks = [
-        ChunkCaption(0, [0, 1], {0: "man enters", 1: "man walks"}, "a man enters and walks", ""),
+        ChunkCaption(
+            0, [0, 1], {0: "man enters", 1: "man walks"}, "a man enters and walks", ""
+        ),
         ChunkCaption(1, [10], {10: "man exits"}, "the man exits", ""),
     ]
     with patch("src.aggregator.requests.post") as mock_post:
         mock_post.return_value = MagicMock(
-            json=MagicMock(return_value={"choices": [{"message": {"content": VALID_JSON}}]}),
+            json=MagicMock(
+                return_value={"choices": [{"message": {"content": VALID_JSON}}]}
+            ),
             raise_for_status=MagicMock(),
         )
         agg = CaptionAggregator()
@@ -35,7 +39,9 @@ def test_aggregator_falls_back_on_bad_json():
     chunks = [ChunkCaption(0, [0], {0: "blah"}, "", "")]
     with patch("src.aggregator.requests.post") as mock_post:
         mock_post.return_value = MagicMock(
-            json=MagicMock(return_value={"choices": [{"message": {"content": "not json at all"}}]}),
+            json=MagicMock(
+                return_value={"choices": [{"message": {"content": "not json at all"}}]}
+            ),
             raise_for_status=MagicMock(),
         )
         agg = CaptionAggregator()
@@ -48,13 +54,14 @@ def test_aggregator_falls_back_on_bad_json():
 
 def test_hierarchical_path_used_for_long_chunk_lists():
     long_chunks = [
-        ChunkCaption(i, [i], {i: f"line {i}"}, f"sum {i}", "")
-        for i in range(45)
+        ChunkCaption(i, [i], {i: f"line {i}"}, f"sum {i}", "") for i in range(45)
     ]
     with patch("src.aggregator.requests.post") as mock_post:
         # First N calls compress meta-captions, last call returns final JSON
         mock_post.return_value = MagicMock(
-            json=MagicMock(return_value={"choices": [{"message": {"content": VALID_JSON}}]}),
+            json=MagicMock(
+                return_value={"choices": [{"message": {"content": VALID_JSON}}]}
+            ),
             raise_for_status=MagicMock(),
         )
         agg = CaptionAggregator(single_pass_max_chunks=30, group_size=10)

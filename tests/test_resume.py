@@ -4,6 +4,7 @@ Verifies:
 - A run DB with a stage marked complete skips that stage when the pipeline runs.
 - A fresh DB runs all stages.
 """
+
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,7 @@ from src.storage import TempoGraphDB
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────
+
 
 def _make_video(path: Path):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -46,6 +48,7 @@ def _make_run_db_with_stage(out_dir: Path, stage_name: str) -> Path:
 
 # ── tests ────────────────────────────────────────────────────────────────
 
+
 class TestResumeSkipsCompletedStage:
     """A run DB where Frame selection is marked complete should skip it."""
 
@@ -66,7 +69,12 @@ class TestResumeSkipsCompletedStage:
 
         config = PipelineConfig(
             backend="llama-server",
-            modules={"behavior": True, "detection": True, "depth": False, "audio": False},
+            modules={
+                "behavior": True,
+                "detection": True,
+                "depth": False,
+                "audio": False,
+            },
             fps=1.0,
             max_frames=20,
             confidence=0.5,
@@ -74,11 +82,13 @@ class TestResumeSkipsCompletedStage:
             output_dir=str(out),
         )
 
-        with patch("src.pipeline_v2.FrameSelector") as MockFS, \
-             patch("src.pipeline_v2.ObjectDetector") as MockDet, \
-             patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, \
-             patch("src.pipeline_v2.CaptionAggregator") as MockAgg, \
-             patch("src.pipeline_v2.FrameScorer") as MockScorer:
+        with patch("src.pipeline_v2.FrameSelector") as MockFS, patch(
+            "src.pipeline_v2.ObjectDetector"
+        ) as MockDet, patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, patch(
+            "src.pipeline_v2.CaptionAggregator"
+        ) as MockAgg, patch(
+            "src.pipeline_v2.FrameScorer"
+        ) as MockScorer:
             MockFS.return_value.select.return_value = MagicMock(
                 frame_indices=[5],
                 keyframe_indices=[],
@@ -132,7 +142,12 @@ class TestFreshRunRunsAllStages:
 
         config = PipelineConfig(
             backend="llama-server",
-            modules={"behavior": True, "detection": True, "depth": False, "audio": False},
+            modules={
+                "behavior": True,
+                "detection": True,
+                "depth": False,
+                "audio": False,
+            },
             fps=1.0,
             max_frames=20,
             confidence=0.5,
@@ -140,11 +155,13 @@ class TestFreshRunRunsAllStages:
             output_dir=str(out),
         )
 
-        with patch("src.pipeline_v2.FrameSelector") as MockFS, \
-             patch("src.pipeline_v2.ObjectDetector") as MockDet, \
-             patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, \
-             patch("src.pipeline_v2.CaptionAggregator") as MockAgg, \
-             patch("src.pipeline_v2.FrameScorer") as MockScorer:
+        with patch("src.pipeline_v2.FrameSelector") as MockFS, patch(
+            "src.pipeline_v2.ObjectDetector"
+        ) as MockDet, patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, patch(
+            "src.pipeline_v2.CaptionAggregator"
+        ) as MockAgg, patch(
+            "src.pipeline_v2.FrameScorer"
+        ) as MockScorer:
             MockFS.return_value.select.return_value = MagicMock(
                 frame_indices=[5],
                 keyframe_indices=[],
@@ -217,7 +234,12 @@ class TestResumeSkipsIntermediateStage:
 
         config = PipelineConfig(
             backend="llama-server",
-            modules={"behavior": True, "detection": True, "depth": False, "audio": False},
+            modules={
+                "behavior": True,
+                "detection": True,
+                "depth": False,
+                "audio": False,
+            },
             fps=1.0,
             max_frames=20,
             confidence=0.5,
@@ -225,11 +247,13 @@ class TestResumeSkipsIntermediateStage:
             output_dir=str(out),
         )
 
-        with patch("src.pipeline_v2.FrameSelector") as MockFS, \
-             patch("src.pipeline_v2.ObjectDetector") as MockDet, \
-             patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, \
-             patch("src.pipeline_v2.CaptionAggregator") as MockAgg, \
-             patch("src.pipeline_v2.FrameScorer") as MockScorer:
+        with patch("src.pipeline_v2.FrameSelector") as MockFS, patch(
+            "src.pipeline_v2.ObjectDetector"
+        ) as MockDet, patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, patch(
+            "src.pipeline_v2.CaptionAggregator"
+        ) as MockAgg, patch(
+            "src.pipeline_v2.FrameScorer"
+        ) as MockScorer:
             MockFS.return_value.select.return_value = MagicMock(
                 frame_indices=[5],
                 keyframe_indices=[],

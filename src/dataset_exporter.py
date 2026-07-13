@@ -52,8 +52,7 @@ def export_coco_annotations(
 
     # Build images from frames table
     frames = conn.execute(
-        "SELECT frame_idx, timestamp_ms, image_path FROM frames "
-        "ORDER BY frame_idx"
+        "SELECT frame_idx, timestamp_ms, image_path FROM frames " "ORDER BY frame_idx"
     ).fetchall()
 
     # Read dimensions from first image only — all frames are resized to
@@ -61,6 +60,7 @@ def export_coco_annotations(
     default_w, default_h = 640, 360
     if frames:
         import cv2
+
         first_img = cv2.imread(frames[0]["image_path"])
         if first_img is not None:
             default_h, default_w = first_img.shape[:2]
@@ -69,14 +69,16 @@ def export_coco_annotations(
     frame_idx_to_image_id: Dict[int, int] = {}
     for img_id, row in enumerate(frames):
         frame_idx_to_image_id[row["frame_idx"]] = img_id
-        images.append({
-            "id": img_id,
-            "file_name": Path(row["image_path"]).name,
-            "width": default_w,
-            "height": default_h,
-            "frame_idx": row["frame_idx"],
-            "timestamp_ms": row["timestamp_ms"],
-        })
+        images.append(
+            {
+                "id": img_id,
+                "file_name": Path(row["image_path"]).name,
+                "width": default_w,
+                "height": default_h,
+                "frame_idx": row["frame_idx"],
+                "timestamp_ms": row["timestamp_ms"],
+            }
+        )
 
     # Build annotations from detections
     detections = conn.execute(
@@ -103,17 +105,23 @@ def export_coco_annotations(
         bbox_h = y2_px - y1_px
 
         cat_id = class_to_id.get(det["class_name"], 0)
-        annotations.append({
-            "id": det["detection_id"],
-            "image_id": image_id,
-            "category_id": cat_id,
-            "bbox": [round(x1_px, 1), round(y1_px, 1),
-                     round(bbox_w, 1), round(bbox_h, 1)],
-            "area": round(bbox_w * bbox_h, 1),
-            "iscrowd": 0,
-            "confidence": round(det["confidence"], 4),
-            "mean_depth": det["mean_depth"],
-        })
+        annotations.append(
+            {
+                "id": det["detection_id"],
+                "image_id": image_id,
+                "category_id": cat_id,
+                "bbox": [
+                    round(x1_px, 1),
+                    round(y1_px, 1),
+                    round(bbox_w, 1),
+                    round(bbox_h, 1),
+                ],
+                "area": round(bbox_w * bbox_h, 1),
+                "iscrowd": 0,
+                "confidence": round(det["confidence"], 4),
+                "mean_depth": det["mean_depth"],
+            }
+        )
 
     coco = {
         "images": images,

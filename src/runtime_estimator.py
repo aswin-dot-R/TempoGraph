@@ -26,17 +26,17 @@ DEPTH_S_PER_FRAME = 0.10
 
 # Whisper realtime ratios on a 3060 over Vulkan (transcription_seconds / audio_seconds).
 WHISPER_RT_RATIO: Dict[str, float] = {
-    "tiny":         1 / 32,
-    "tiny.en":      1 / 32,
-    "base":         1 / 16,
-    "base.en":      1 / 16,
-    "small":        1 / 6,
-    "small.en":     1 / 6,
-    "medium":       1 / 2,
-    "medium.en":    1 / 2,
-    "large-v1":     1.0,
-    "large-v2":     1.0,
-    "large-v3":     1.0,
+    "tiny": 1 / 32,
+    "tiny.en": 1 / 32,
+    "base": 1 / 16,
+    "base.en": 1 / 16,
+    "small": 1 / 6,
+    "small.en": 1 / 6,
+    "medium": 1 / 2,
+    "medium.en": 1 / 2,
+    "large-v1": 1.0,
+    "large-v2": 1.0,
+    "large-v3": 1.0,
     "large-v3-turbo": 1 / 4,
 }
 
@@ -109,46 +109,60 @@ def estimate_run(
 
     # 1. Frame selection (motion delta scan over the entire video at sample fps)
     frame_select_s = n_sampled * 0.02 + n_sampled * PER_FRAME_OVERHEAD_S
-    stages.append(StageEstimate("Frame selection", frame_select_s,
-                                f"{n_sampled} sampled frames"))
+    stages.append(
+        StageEstimate("Frame selection", frame_select_s, f"{n_sampled} sampled frames")
+    )
 
     # 1.5 Audio
     if audio_enabled:
         ratio = WHISPER_RT_RATIO.get(whisper_model, 1 / 8)
         audio_s = WHISPER_LOAD_S + duration_s * ratio
-        stages.append(StageEstimate("Audio transcription", audio_s,
-                                    f"{whisper_model} on {duration_s:.1f}s of audio"))
+        stages.append(
+            StageEstimate(
+                "Audio transcription",
+                audio_s,
+                f"{whisper_model} on {duration_s:.1f}s of audio",
+            )
+        )
 
     # 2. YOLO sweep
     per = YOLO_S_PER_FRAME.get(yolo_size, 0.05)
     if use_segmentation:
         per *= 1.15
     yolo_s = YOLO_LOAD_S + n_sampled * per
-    stages.append(StageEstimate("YOLO detection", yolo_s,
-                                f"yolo26{yolo_size}{'-seg' if use_segmentation else ''} × {n_sampled}"))
+    stages.append(
+        StageEstimate(
+            "YOLO detection",
+            yolo_s,
+            f"yolo26{yolo_size}{'-seg' if use_segmentation else ''} × {n_sampled}",
+        )
+    )
 
     # 3. Depth
     if depth_enabled:
         depth_s = DEPTH_LOAD_S + n_sampled * DEPTH_S_PER_FRAME
-        stages.append(StageEstimate("Depth estimation", depth_s,
-                                    f"vits × {n_sampled}"))
+        stages.append(StageEstimate("Depth estimation", depth_s, f"vits × {n_sampled}"))
 
     # 4. Frame scoring (cheap)
-    stages.append(StageEstimate("Frame scoring", 0.5,
-                                f"{n_vlm} VLM frames"))
+    stages.append(StageEstimate("Frame scoring", 0.5, f"{n_vlm} VLM frames"))
 
     # 5. VLM captioning
     if vlm_autostart_cold:
-        stages.append(StageEstimate("VLM autostart", VLM_AUTOSTART_COLD_S,
-                                    "qwen3.5-9B model load on AMD"))
+        stages.append(
+            StageEstimate(
+                "VLM autostart", VLM_AUTOSTART_COLD_S, "qwen3.5-9B model load on AMD"
+            )
+        )
     chunk_s = VLM_BASE_S_PER_CHUNK + chunk_size * VLM_S_PER_FRAME_IN_CHUNK
     vlm_s = n_chunks * chunk_s
-    stages.append(StageEstimate("VLM captioning", vlm_s,
-                                f"{n_chunks} chunks × ~{chunk_s:.1f}s"))
+    stages.append(
+        StageEstimate("VLM captioning", vlm_s, f"{n_chunks} chunks × ~{chunk_s:.1f}s")
+    )
 
     # 6. Aggregator
-    stages.append(StageEstimate("Aggregation", AGGREGATOR_S,
-                                "single text-only LLM call"))
+    stages.append(
+        StageEstimate("Aggregation", AGGREGATOR_S, "single text-only LLM call")
+    )
 
     total = sum(s.seconds for s in stages)
     return RunEstimate(total_s=total, stages=stages)
@@ -222,10 +236,11 @@ def load_calibration(max_entries: int = 50) -> Dict[str, float]:
     result: Dict[str, float] = {}
     for name, recs in entries.items():
         recent = recs[-max_entries:]
-        valid = [(r["elapsed_s"], r["n_units"]) for r in recent if r.get("n_units", 0) > 0]
+        valid = [
+            (r["elapsed_s"], r["n_units"]) for r in recent if r.get("n_units", 0) > 0
+        ]
         if valid:
             total_time = sum(e for e, _ in valid)
             total_units = sum(n for _, n in valid)
             result[name] = total_time / total_units
     return result
-

@@ -79,8 +79,9 @@ class TestSchemaMigration:
         # And new-style inserts with masks work on the migrated DB
         mask = np.zeros((6, 8), dtype=np.uint8)
         mask[2:5, 3:7] = 1
-        db.insert_detection(0, None, "cat", 0.2, 0.2, 0.6, 0.6, 0.8,
-                            mask_rle=encode_to_string(mask))
+        db.insert_detection(
+            0, None, "cat", 0.2, 0.2, 0.6, 0.6, 0.8, mask_rle=encode_to_string(mask)
+        )
         db.close()
 
     def test_reopening_migrated_db_is_idempotent(self, tmp_path):
@@ -97,8 +98,17 @@ class TestMaskStorageRoundTrip:
         db.insert_frame(0, 0, "frame_000000.jpg", True, 1.0)
         mask = np.zeros((30, 40), dtype=np.uint8)
         mask[5:20, 10:35] = 1
-        db.insert_detection(0, 7, "person", 0.25, 0.16, 0.87, 0.66, 0.77,
-                            mask_rle=encode_to_string(mask))
+        db.insert_detection(
+            0,
+            7,
+            "person",
+            0.25,
+            0.16,
+            0.87,
+            0.66,
+            0.77,
+            mask_rle=encode_to_string(mask),
+        )
         db.insert_detection(0, None, "chair", 0.0, 0.0, 0.1, 0.1, 0.5)
 
         dets = db.get_detections_for_frame(0)
@@ -110,8 +120,9 @@ class TestMaskStorageRoundTrip:
         np.testing.assert_array_equal(decoded, mask)
 
 
-@pytest.mark.skipif(not SEG_WEIGHTS.exists(),
-                    reason="yolo26n-seg.pt not present in repo root")
+@pytest.mark.skipif(
+    not SEG_WEIGHTS.exists(), reason="yolo26n-seg.pt not present in repo root"
+)
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
 class TestSegSmoke:
     """CPU seg-model smoke run on a 5 s synthetic ffmpeg testsrc clip."""
@@ -125,9 +136,19 @@ class TestSegSmoke:
         tmp = tmp_path_factory.mktemp("seg_smoke")
         clip = tmp / "testsrc5.mp4"
         subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error",
-             "-f", "lavfi", "-i", "testsrc=duration=5:size=640x360:rate=30",
-             "-pix_fmt", "yuv420p", str(clip)],
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=5:size=640x360:rate=30",
+                "-pix_fmt",
+                "yuv420p",
+                str(clip),
+            ],
             check=True,
         )
 
@@ -148,8 +169,9 @@ class TestSegSmoke:
 
         db = TempoGraphDB(tmp / "tempograph.db")
         for idx in indices:
-            db.insert_frame(idx, int(idx * 1000 / 30), str(tmp / f"frame_{idx:06d}.jpg"),
-                            False, 0.0)
+            db.insert_frame(
+                idx, int(idx * 1000 / 30), str(tmp / f"frame_{idx:06d}.jpg"), False, 0.0
+            )
 
         # testsrc is an abstract pattern; only very low confidence yields
         # (spurious but deterministic) instances, which is all the smoke
@@ -186,8 +208,6 @@ class TestSegSmoke:
         """Non-seg runs must keep mask_rle NULL (regression guard)."""
         db = TempoGraphDB(tmp_path / "tempograph.db")
         db.insert_detection(0, None, "person", 0.1, 0.1, 0.5, 0.5, 0.9)
-        row = db._conn.execute(
-            "SELECT mask_rle FROM detections"
-        ).fetchone()
+        row = db._conn.execute("SELECT mask_rle FROM detections").fetchone()
         db.close()
         assert row["mask_rle"] is None

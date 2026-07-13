@@ -47,13 +47,21 @@ class FrameSelector:
 
         if camera_mode == CameraMode.STATIC:
             scan_indices, deltas = self._scan_pixel_deltas(
-                cap, scan_interval, width, height,
-                total_frames=total, on_progress=on_progress,
+                cap,
+                scan_interval,
+                width,
+                height,
+                total_frames=total,
+                on_progress=on_progress,
             )
         else:
             scan_indices, deltas = self._scan_motion_compensated_deltas(
-                cap, scan_interval, width, height,
-                total_frames=total, on_progress=on_progress,
+                cap,
+                scan_interval,
+                width,
+                height,
+                total_frames=total,
+                on_progress=on_progress,
             )
 
         threshold = self._compute_threshold(deltas, threshold_mult)
@@ -81,10 +89,16 @@ class FrameSelector:
         )
 
     def _scan_pixel_deltas(
-        self, cap: cv2.VideoCapture, scan_interval: int, width: int, height: int,
-        total_frames: int = 0, on_progress: "Optional[callable]" = None,
+        self,
+        cap: cv2.VideoCapture,
+        scan_interval: int,
+        width: int,
+        height: int,
+        total_frames: int = 0,
+        on_progress: "Optional[callable]" = None,
     ) -> Tuple[List[int], List[float]]:
         import time as _t
+
         thumb_w = min(self.thumb_width, width)
         thumb_h = max(1, int(height * thumb_w / width)) if width > 0 else 120
 
@@ -113,21 +127,30 @@ class FrameSelector:
                     elapsed = _t.time() - t0
                     fps = len(indices) / max(elapsed, 0.01)
                     eta = (total_frames / scan_interval - len(indices)) / max(fps, 0.1)
-                    on_progress({
-                        "frame": i, "total": total_frames,
-                        "scanned": len(indices),
-                        "fps": round(fps, 1),
-                        "eta_s": round(max(0, eta), 1),
-                        "elapsed_s": round(elapsed, 1),
-                    })
+                    on_progress(
+                        {
+                            "frame": i,
+                            "total": total_frames,
+                            "scanned": len(indices),
+                            "fps": round(fps, 1),
+                            "eta_s": round(max(0, eta), 1),
+                            "elapsed_s": round(elapsed, 1),
+                        }
+                    )
             i += 1
         return indices, deltas
 
     def _scan_motion_compensated_deltas(
-        self, cap: cv2.VideoCapture, scan_interval: int, width: int, height: int,
-        total_frames: int = 0, on_progress: "Optional[callable]" = None,
+        self,
+        cap: cv2.VideoCapture,
+        scan_interval: int,
+        width: int,
+        height: int,
+        total_frames: int = 0,
+        on_progress: "Optional[callable]" = None,
     ) -> Tuple[List[int], List[float]]:
         import time as _t
+
         thumb_w = min(self.thumb_width, width)
         thumb_h = max(1, int(height * thumb_w / width)) if width > 0 else 120
         orb = cv2.ORB_create(nfeatures=self.orb_features)
@@ -168,13 +191,16 @@ class FrameSelector:
                     elapsed = _t.time() - t0
                     fps = len(indices) / max(elapsed, 0.01)
                     eta = (total_frames / scan_interval - len(indices)) / max(fps, 0.1)
-                    on_progress({
-                        "frame": i, "total": total_frames,
-                        "scanned": len(indices),
-                        "fps": round(fps, 1),
-                        "eta_s": round(max(0, eta), 1),
-                        "elapsed_s": round(elapsed, 1),
-                    })
+                    on_progress(
+                        {
+                            "frame": i,
+                            "total": total_frames,
+                            "scanned": len(indices),
+                            "fps": round(fps, 1),
+                            "eta_s": round(max(0, eta), 1),
+                            "elapsed_s": round(elapsed, 1),
+                        }
+                    )
             i += 1
         return indices, deltas
 
@@ -184,19 +210,33 @@ class FrameSelector:
         try:
             matches = bf.match(prev_des, des)
             if len(matches) < 8:
-                return float(np.mean(np.abs(prev_gray.astype(np.float32) - gray.astype(np.float32))))
+                return float(
+                    np.mean(
+                        np.abs(prev_gray.astype(np.float32) - gray.astype(np.float32))
+                    )
+                )
 
-            src_pts = np.float32([prev_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+            src_pts = np.float32([prev_kp[m.queryIdx].pt for m in matches]).reshape(
+                -1, 1, 2
+            )
             dst_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
             H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0)
             if H is None:
-                return float(np.mean(np.abs(prev_gray.astype(np.float32) - gray.astype(np.float32))))
+                return float(
+                    np.mean(
+                        np.abs(prev_gray.astype(np.float32) - gray.astype(np.float32))
+                    )
+                )
 
             h, w = gray.shape
             warped = cv2.warpPerspective(prev_gray, H, (w, h))
-            return float(np.mean(np.abs(gray.astype(np.float32) - warped.astype(np.float32))))
+            return float(
+                np.mean(np.abs(gray.astype(np.float32) - warped.astype(np.float32)))
+            )
         except cv2.error:
-            return float(np.mean(np.abs(prev_gray.astype(np.float32) - gray.astype(np.float32))))
+            return float(
+                np.mean(np.abs(prev_gray.astype(np.float32) - gray.astype(np.float32)))
+            )
 
     def _compute_threshold(self, deltas: List[float], mult: float) -> float:
         non_zero = [d for d in deltas if d > 0]
@@ -208,13 +248,17 @@ class FrameSelector:
     def _extract_keyframes(
         self, indices: List[int], deltas: List[float], threshold: float
     ) -> List[int]:
-        kf = [indices[i] for i, d in enumerate(deltas) if d >= threshold and threshold > 0]
+        kf = [
+            indices[i] for i, d in enumerate(deltas) if d >= threshold and threshold > 0
+        ]
         # Always include first frame
         if indices and indices[0] not in kf:
             kf.insert(0, indices[0])
         return sorted(set(kf))
 
-    def _uniform_sample(self, total_frames: int, video_fps: float, sample_fps: float) -> List[int]:
+    def _uniform_sample(
+        self, total_frames: int, video_fps: float, sample_fps: float
+    ) -> List[int]:
         if sample_fps <= 0 or video_fps <= 0:
             return []
         step = max(1, int(round(video_fps / sample_fps)))
@@ -243,11 +287,22 @@ class FrameSelector:
                 small = cv2.resize(frame, (thumb_w, thumb_h))
                 gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
                 kp, des = orb.detectAndCompute(gray, None)
-                if prev_des is not None and des is not None and len(kp) > 0 and len(prev_kp) > 0:
+                if (
+                    prev_des is not None
+                    and des is not None
+                    and len(kp) > 0
+                    and len(prev_kp) > 0
+                ):
                     matches = bf.match(prev_des, des)
                     if matches:
                         d = np.mean(
-                            [np.linalg.norm(np.array(prev_kp[m.queryIdx].pt) - np.array(kp[m.trainIdx].pt)) for m in matches]
+                            [
+                                np.linalg.norm(
+                                    np.array(prev_kp[m.queryIdx].pt)
+                                    - np.array(kp[m.trainIdx].pt)
+                                )
+                                for m in matches
+                            ]
                         )
                         displacements.append(d)
                 prev_kp = kp

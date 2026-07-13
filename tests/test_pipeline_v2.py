@@ -32,9 +32,9 @@ def test_pipeline_v2_runs_end_to_end_with_mocked_models(tmp_path):
         output_dir=str(out),
     )
 
-    with patch("src.pipeline_v2.ObjectDetector") as MockDet, \
-         patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, \
-         patch("src.pipeline_v2.CaptionAggregator") as MockAgg:
+    with patch("src.pipeline_v2.ObjectDetector") as MockDet, patch(
+        "src.pipeline_v2.LlamaServerBackend"
+    ) as MockLLM, patch("src.pipeline_v2.CaptionAggregator") as MockAgg:
         MockDet.return_value.detect_to_db = MagicMock()
         MockDet.return_value.cleanup = MagicMock()
         MockLLM.return_value.caption_chunks = MagicMock(return_value=[])

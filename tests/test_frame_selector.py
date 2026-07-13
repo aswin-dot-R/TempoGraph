@@ -7,7 +7,9 @@ from src.modules.frame_selector import FrameSelector
 from src.models import CameraMode
 
 
-def _make_synthetic_video(path: Path, n_frames: int = 60, w: int = 320, h: int = 240) -> None:
+def _make_synthetic_video(
+    path: Path, n_frames: int = 60, w: int = 320, h: int = 240
+) -> None:
     """Create a synthetic video where frames 20-25 have a sudden brightness shift."""
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(path), fourcc, 30.0, (w, h))
@@ -81,7 +83,7 @@ def test_moving_mode_compensates_pure_pan():
         writer = cv2.VideoWriter(str(video), fourcc, 30.0, (w, h))
         for i in range(60):
             shift = i * 2  # 2 pixels per frame
-            frame = base[:, shift:shift + w].copy()
+            frame = base[:, shift : shift + w].copy()
             writer.write(frame)
         writer.release()
 

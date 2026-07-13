@@ -43,6 +43,7 @@ from src.models import DetectionResult, DetectionBox
 
 try:
     import torch
+
     _TORCH_AVAILABLE = True
 except ImportError:
     torch = None  # type: ignore[assignment]
@@ -158,7 +159,9 @@ class ObjectDetector:
                 self.logger.warning(f"Error processing frame {frame_idx}: {e}")
                 continue
 
-        avg_time_ms = (total_inference_time / len(frame_paths)) * 1000 if frame_paths else 0
+        avg_time_ms = (
+            (total_inference_time / len(frame_paths)) * 1000 if frame_paths else 0
+        )
         self.logger.info(
             f"Detection complete: {len(boxes)} detections across {len(frame_paths)} frames "
             f"(avg {avg_time_ms:.1f}ms/frame, total {total_inference_time:.2f}s)"
@@ -227,7 +230,11 @@ class ObjectDetector:
 
                     conf = box.conf[0] if hasattr(box.conf, "__getitem__") else box.conf
                     conf = float(conf)
-                    cls_idx = int(box.cls[0]) if hasattr(box.cls, "__getitem__") else int(box.cls)
+                    cls_idx = (
+                        int(box.cls[0])
+                        if hasattr(box.cls, "__getitem__")
+                        else int(box.cls)
+                    )
                     class_name = self._model.names[cls_idx]
 
                     track_id = None
@@ -265,15 +272,17 @@ class ObjectDetector:
                 fps = (step + 1) / max(elapsed, 0.01)
                 remaining = total - step - 1
                 eta = remaining / max(fps, 0.1)
-                on_progress({
-                    "frame_idx": int(frame_idx),
-                    "step": step + 1,
-                    "total": total,
-                    "detections": det_count,
-                    "fps": round(fps, 1),
-                    "eta_s": round(max(0, eta), 1),
-                    "elapsed_s": round(elapsed, 1),
-                })
+                on_progress(
+                    {
+                        "frame_idx": int(frame_idx),
+                        "step": step + 1,
+                        "total": total,
+                        "detections": det_count,
+                        "fps": round(fps, 1),
+                        "eta_s": round(max(0, eta), 1),
+                        "elapsed_s": round(elapsed, 1),
+                    }
+                )
 
     def _encode_mask_rle(
         self, polygon_xyn, frame_width: int, frame_height: int
@@ -292,8 +301,7 @@ class ObjectDetector:
             if polygon_xyn is None or len(polygon_xyn) < 3:
                 return None
             pts = np.round(
-                np.asarray(polygon_xyn, dtype=np.float64)
-                * [frame_width, frame_height]
+                np.asarray(polygon_xyn, dtype=np.float64) * [frame_width, frame_height]
             ).astype(np.int32)
             mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
             cv2.fillPoly(mask, [pts], 1)

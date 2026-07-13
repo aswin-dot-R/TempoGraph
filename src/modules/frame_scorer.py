@@ -8,10 +8,10 @@ class FrameScorer:
     def __init__(
         self,
         db,
-        alpha: float = 1.0,   # delta weight
-        beta: float = 2.0,    # detection-class set change
-        gamma: float = 2.0,   # track_id churn
-        delta_w: float = 0.5, # mean IoU drop
+        alpha: float = 1.0,  # delta weight
+        beta: float = 2.0,  # detection-class set change
+        gamma: float = 2.0,  # track_id churn
+        delta_w: float = 0.5,  # mean IoU drop
     ):
         self.db = db
         self.alpha = alpha
@@ -65,7 +65,9 @@ class FrameScorer:
         top_non_forced = [i for _, i in non_forced[:remaining_budget]]
 
         result = sorted(set(forced) | set(top_non_forced))
-        self.logger.info(f"Frame scorer: {len(result)}/{len(sorted_candidates)} selected for VLM")
+        self.logger.info(
+            f"Frame scorer: {len(result)}/{len(sorted_candidates)} selected for VLM"
+        )
         return result
 
     def _class_set_change(self, prev_dets, cur_dets) -> float:
@@ -79,7 +81,9 @@ class FrameScorer:
         return float(len(prev_ids ^ cur_ids))
 
     def _mean_iou_drop(self, prev_dets, cur_dets) -> float:
-        prev_by_track = {d["track_id"]: d for d in prev_dets if d["track_id"] is not None}
+        prev_by_track = {
+            d["track_id"]: d for d in prev_dets if d["track_id"] is not None
+        }
         cur_by_track = {d["track_id"]: d for d in cur_dets if d["track_id"] is not None}
         common = set(prev_by_track) & set(cur_by_track)
         if not common:
@@ -95,5 +99,9 @@ class FrameScorer:
         ix2, iy2 = min(ax2, bx2), min(ay2, by2)
         iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
         inter = iw * ih
-        union = max(0.0, (ax2 - ax1) * (ay2 - ay1)) + max(0.0, (bx2 - bx1) * (by2 - by1)) - inter
+        union = (
+            max(0.0, (ax2 - ax1) * (ay2 - ay1))
+            + max(0.0, (bx2 - bx1) * (by2 - by1))
+            - inter
+        )
         return inter / union if union > 0 else 0.0

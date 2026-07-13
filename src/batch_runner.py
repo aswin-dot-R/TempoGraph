@@ -92,7 +92,8 @@ class BatchRunner:
         if not self.video_dir.exists():
             raise FileNotFoundError(f"Video directory not found: {self.video_dir}")
         videos = sorted(
-            p for p in self.video_dir.iterdir()
+            p
+            for p in self.video_dir.iterdir()
             if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
         )
         logger.info(f"Discovered {len(videos)} videos in {self.video_dir}")
@@ -132,11 +133,19 @@ class BatchRunner:
             try:
                 self._process_one(video_path)
                 elapsed = time.time() - t0
-                results[name] = {"status": "done", "time_s": round(elapsed, 1), "error": None}
+                results[name] = {
+                    "status": "done",
+                    "time_s": round(elapsed, 1),
+                    "error": None,
+                }
                 logger.info(f"  Done in {elapsed:.1f}s: {name}")
             except Exception as e:
                 elapsed = time.time() - t0
-                results[name] = {"status": "error", "time_s": round(elapsed, 1), "error": str(e)}
+                results[name] = {
+                    "status": "error",
+                    "time_s": round(elapsed, 1),
+                    "error": str(e),
+                }
                 logger.error(f"  Failed ({elapsed:.1f}s): {name} — {e}")
 
         total_elapsed = time.time() - total_start
@@ -151,16 +160,21 @@ class BatchRunner:
 
         # Write batch summary
         import json
+
         summary_path = self.output_dir / "batch_summary.json"
         with open(summary_path, "w") as f:
-            json.dump({
-                "total_videos": len(videos),
-                "done": done,
-                "skipped": skipped,
-                "errors": errors,
-                "total_time_s": round(total_elapsed, 1),
-                "per_video": results,
-            }, f, indent=2)
+            json.dump(
+                {
+                    "total_videos": len(videos),
+                    "done": done,
+                    "skipped": skipped,
+                    "errors": errors,
+                    "total_time_s": round(total_elapsed, 1),
+                    "per_video": results,
+                },
+                f,
+                indent=2,
+            )
         logger.info(f"Batch summary → {summary_path}")
 
         return results
@@ -211,6 +225,7 @@ class BatchRunner:
         if self.export_datasets:
             try:
                 from src.dataset_exporter import export_all
+
                 export_all(run_dir, video_name=video_path.stem)
             except Exception as e:
                 logger.warning(f"Dataset export failed for {video_path.name}: {e}")
@@ -218,39 +233,52 @@ class BatchRunner:
 
 def main():
     import argparse
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     parser = argparse.ArgumentParser(
         description="Batch process videos through TempoGraph pipeline"
     )
-    parser.add_argument("--video-dir", required=True,
-                        help="Directory containing video files")
-    parser.add_argument("--output-dir", default="results",
-                        help="Root output directory (default: results/)")
-    parser.add_argument("--export", action="store_true",
-                        help="Export dataset formats (COCO, JSONL) after each video")
-    parser.add_argument("--no-skip", action="store_true",
-                        help="Re-process already completed videos")
+    parser.add_argument(
+        "--video-dir", required=True, help="Directory containing video files"
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="results",
+        help="Root output directory (default: results/)",
+    )
+    parser.add_argument(
+        "--export",
+        action="store_true",
+        help="Export dataset formats (COCO, JSONL) after each video",
+    )
+    parser.add_argument(
+        "--no-skip", action="store_true", help="Re-process already completed videos"
+    )
 
     # Pipeline options
-    parser.add_argument("--camera", default="static",
-                        choices=["static", "moving", "auto"])
+    parser.add_argument(
+        "--camera", default="static", choices=["static", "moving", "auto"]
+    )
     parser.add_argument("--yolo-fps", type=float, default=1.0)
     parser.add_argument("--vlm-fps", type=float, default=0.5)
     parser.add_argument("--chunk-size", type=int, default=10)
     parser.add_argument("--depth", action="store_true")
     parser.add_argument("--seg", action="store_true", default=True)
-    parser.add_argument("--yolo-size", default="n",
-                        choices=["n", "s", "m", "l", "x"])
+    parser.add_argument("--yolo-size", default="n", choices=["n", "s", "m", "l", "x"])
     parser.add_argument("--threshold-mult", type=float, default=1.0)
     parser.add_argument("--vlm-dedup-threshold", type=float, default=0.92)
-    parser.add_argument("--vlm-frame-mode", default="keyframes",
-                        choices=["scored", "keyframes"])
+    parser.add_argument(
+        "--vlm-frame-mode", default="keyframes", choices=["scored", "keyframes"]
+    )
     parser.add_argument("--vlm-url", default="http://127.0.0.1:8082")
     parser.add_argument("--vlm-model", default="Qwen3.5-9B-Q8_0.gguf")
     parser.add_argument("--vlm-autostart-service", default="qwen35-turboquant.service")
-    parser.add_argument("--vlm-autostop", action="store_true",
-                        help="Stop VLM service after all videos are processed")
+    parser.add_argument(
+        "--vlm-autostop",
+        action="store_true",
+        help="Stop VLM service after all videos are processed",
+    )
     parser.add_argument("--audio", action="store_true")
     parser.add_argument("--whisper-model", default="base.en")
     parser.add_argument("--whisper-gpu-device", type=int, default=1)
@@ -287,10 +315,12 @@ def main():
     # Optionally stop VLM after the entire batch
     if args.vlm_autostop and args.vlm_autostart_service:
         import subprocess
+
         try:
             subprocess.run(
                 ["systemctl", "--user", "stop", args.vlm_autostart_service],
-                check=True, timeout=30,
+                check=True,
+                timeout=30,
             )
             logger.info(f"Stopped {args.vlm_autostart_service}")
         except Exception as e:

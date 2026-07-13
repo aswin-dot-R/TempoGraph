@@ -56,7 +56,7 @@ def decode(rle: Dict) -> np.ndarray:
         if c < 0:
             raise ValueError(f"negative run length {c} in RLE counts")
         if val:
-            flat[pos:pos + c] = 1
+            flat[pos : pos + c] = 1
         pos += c
         val ^= 1
     if pos != h * w:

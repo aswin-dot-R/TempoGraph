@@ -54,8 +54,7 @@ class TestRoundTripProperty:
 class TestCocoSemantics:
     def test_column_major_counts(self):
         """counts follow column-major order and start with the zero-run."""
-        mask = np.array([[1, 0],
-                         [0, 1]], dtype=np.uint8)
+        mask = np.array([[1, 0], [0, 1]], dtype=np.uint8)
         rle = encode(mask)
         # Fortran-flattened: [1, 0, 0, 1] -> zeros run 0, ones 1, zeros 2, ones 1
         assert rle == {"size": [2, 2], "counts": [0, 1, 2, 1]}

@@ -21,8 +21,14 @@ def test_estimate_to_db_writes_depth_and_per_bbox_means(tmp_path):
     db = TempoGraphDB(tmp_path / "t.db")
     db.insert_frame(0, 0, str(f1), True, 0.0)
     det_id = db.insert_detection(
-        frame_idx=0, track_id=1, class_name="person",
-        x1=0.0, y1=0.0, x2=0.5, y2=0.5, confidence=0.9,
+        frame_idx=0,
+        track_id=1,
+        class_name="person",
+        x1=0.0,
+        y1=0.0,
+        x2=0.5,
+        y2=0.5,
+        confidence=0.9,
     )
 
     # Mock depth model: returns a depth map where left-half=0.2, right-half=0.8

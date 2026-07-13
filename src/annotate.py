@@ -16,9 +16,14 @@ import numpy as np
 from src.rle import decode_from_string
 
 PALETTE = [
-    (66, 165, 245), (102, 187, 106), (239, 83, 80),
-    (255, 167, 38), (171, 71, 188), (38, 198, 218),
-    (236, 64, 122), (141, 110, 99),
+    (66, 165, 245),
+    (102, 187, 106),
+    (239, 83, 80),
+    (255, 167, 38),
+    (171, 71, 188),
+    (38, 198, 218),
+    (236, 64, 122),
+    (141, 110, 99),
 ]
 
 
@@ -35,9 +40,12 @@ def _entity_key(det: dict) -> str:
     return str(det.get("class_name", "?"))
 
 
-def draw_detections(image_bgr: np.ndarray, dets: List[dict],
-                    min_conf: float = 0.0,
-                    highlight_classes: Optional[set] = None) -> np.ndarray:
+def draw_detections(
+    image_bgr: np.ndarray,
+    dets: List[dict],
+    min_conf: float = 0.0,
+    highlight_classes: Optional[set] = None,
+) -> np.ndarray:
     img = image_bgr.copy()
     h, w = img.shape[:2]
     seen: Dict[str, Tuple[int, int, int]] = {}
@@ -48,20 +56,33 @@ def draw_detections(image_bgr: np.ndarray, dets: List[dict],
         color = color_for(cls, seen)
         if highlight_classes and cls not in highlight_classes:
             color = (120, 120, 120)
-        x1 = max(0, int(d["x1"] * w)); y1 = max(0, int(d["y1"] * h))
-        x2 = min(w - 1, int(d["x2"] * w)); y2 = min(h - 1, int(d["y2"] * h))
+        x1 = max(0, int(d["x1"] * w))
+        y1 = max(0, int(d["y1"] * h))
+        x2 = min(w - 1, int(d["x2"] * w))
+        y2 = min(h - 1, int(d["y2"] * h))
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-        depth_str = f" d={d['mean_depth']:.2f}" if d.get("mean_depth") is not None else ""
+        depth_str = (
+            f" d={d['mean_depth']:.2f}" if d.get("mean_depth") is not None else ""
+        )
         label = f"{cls} {d['confidence']:.2f}{depth_str}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         cv2.rectangle(img, (x1, max(0, y1 - th - 4)), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(img, label, (x1 + 2, max(th, y1 - 2)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            img,
+            label,
+            (x1 + 2, max(th, y1 - 2)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
     return img
 
 
-def draw_masks(image_bgr: np.ndarray, dets: List[dict],
-               min_conf: float = 0.0, alpha: float = 0.45) -> np.ndarray:
+def draw_masks(
+    image_bgr: np.ndarray, dets: List[dict], min_conf: float = 0.0, alpha: float = 0.45
+) -> np.ndarray:
     """Overlay decoded instance masks as semi-transparent per-entity fills.
 
     Detections without a ``mask_rle`` value (bbox-only runs, legacy DBs) are
@@ -88,8 +109,9 @@ def draw_masks(image_bgr: np.ndarray, dets: List[dict],
     return img
 
 
-def apply_depth_overlay(image_bgr: np.ndarray, depth_npy_path: Optional[str],
-                        alpha: float = 0.45) -> np.ndarray:
+def apply_depth_overlay(
+    image_bgr: np.ndarray, depth_npy_path: Optional[str], alpha: float = 0.45
+) -> np.ndarray:
     """Blend a depth heatmap (from a resolved .npy path) onto a frame."""
     if not depth_npy_path:
         return image_bgr
@@ -169,10 +191,26 @@ def build_annotated_video(
         if show_dets:
             img = draw_detections(img, dets, min_conf=min_conf)
         ts_s = fr["timestamp_ms"] / 1000.0
-        cv2.putText(img, f"frame #{fr['frame_idx']}  t={ts_s:.2f}s",
-                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(img, f"frame #{fr['frame_idx']}  t={ts_s:.2f}s",
-                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            img,
+            f"frame #{fr['frame_idx']}  t={ts_s:.2f}s",
+            (8, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            img,
+            f"frame #{fr['frame_idx']}  t={ts_s:.2f}s",
+            (8, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
         writer.write(img)
         if on_progress is not None:
             on_progress((i + 1) / len(frames))

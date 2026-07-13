@@ -39,13 +39,27 @@ def make_fixture_run(results_dir: Path, name: str = "maskrun") -> Path:
         db.insert_frame(frame_idx, frame_idx * 33, str(p), i == 0, 0.5)
 
         mask = np.zeros((h, w), dtype=np.uint8)
-        mask[10:40, 20 + i * 10:80 + i * 10] = 1
+        mask[10:40, 20 + i * 10 : 80 + i * 10] = 1
         db.insert_detection(
-            frame_idx, 1, "dog", 0.12, 0.11, 0.55, 0.5, 0.91,
+            frame_idx,
+            1,
+            "dog",
+            0.12,
+            0.11,
+            0.55,
+            0.5,
+            0.91,
             mask_rle=encode_to_string(mask),
         )
         db.insert_detection(
-            frame_idx, 2, "person", 0.5, 0.2, 0.9, 0.95, 0.83,
+            frame_idx,
+            2,
+            "person",
+            0.5,
+            0.2,
+            0.9,
+            0.95,
+            0.83,
             mask_rle=encode_to_string(np.flipud(mask)),
         )
     # Pre-cache a summary so the page never probes the LLM endpoint.
@@ -54,18 +68,38 @@ def make_fixture_run(results_dir: Path, name: str = "maskrun") -> Path:
 
     analysis = {
         "entities": [
-            {"id": "dog_1", "type": "dog", "first_seen": "00:00",
-             "last_seen": "00:02", "description": "a brown dog"},
-            {"id": "person_1", "type": "person", "first_seen": "00:00",
-             "last_seen": "00:02", "description": "a person in a red coat"},
+            {
+                "id": "dog_1",
+                "type": "dog",
+                "first_seen": "00:00",
+                "last_seen": "00:02",
+                "description": "a brown dog",
+            },
+            {
+                "id": "person_1",
+                "type": "person",
+                "first_seen": "00:00",
+                "last_seen": "00:02",
+                "description": "a person in a red coat",
+            },
         ],
         "visual_events": [
-            {"type": "approach", "start_time": "00:00", "end_time": "00:01",
-             "description": "dog approaches person",
-             "entities": ["dog_1", "person_1"], "confidence": 0.8},
-            {"type": "interact", "start_time": "00:01", "end_time": "00:02",
-             "description": "dog and person interact",
-             "entities": ["dog_1", "person_1"], "confidence": 0.9},
+            {
+                "type": "approach",
+                "start_time": "00:00",
+                "end_time": "00:01",
+                "description": "dog approaches person",
+                "entities": ["dog_1", "person_1"],
+                "confidence": 0.8,
+            },
+            {
+                "type": "interact",
+                "start_time": "00:01",
+                "end_time": "00:02",
+                "description": "dog and person interact",
+                "entities": ["dog_1", "person_1"],
+                "confidence": 0.9,
+            },
         ],
         "audio_events": [],
         "summary": "A dog approaches and interacts with a person.",

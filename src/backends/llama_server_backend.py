@@ -194,14 +194,20 @@ NEW_ENTITIES: <comma-separated list like 'E3=red car, E4=brown dog' or 'none'>
         on_chunk: Optional[Callable[[dict], None]] = None,
     ) -> List[ChunkCaption]:
         seed = "this is the start"
-        entity_registry: Dict[str, str] = {}  # e.g. {"E1": "boy in blue shirt", "E2": "T-Rex"}
+        entity_registry: Dict[str, str] = (
+            {}
+        )  # e.g. {"E1": "boy in blue shirt", "E2": "T-Rex"}
         results: List[ChunkCaption] = []
         n_ctx = self.get_n_ctx()
         n_total = len(chunks)
 
         for chunk_id, frame_indices in chunks:
             t0 = time.time()
-            usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            usage: Dict[str, int] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
             try:
                 images_b64: List[str] = []
                 frame_lines: List[str] = []
@@ -251,18 +257,20 @@ NEW_ENTITIES: <comma-separated list like 'E3=red car, E4=brown dog' or 'none'>
 
                 if on_chunk is not None:
                     try:
-                        on_chunk({
-                            "chunk_id": chunk_id,
-                            "chunk_index": len(results) - 1,
-                            "n_total": n_total,
-                            "n_images": len(images_b64),
-                            "prompt_tokens": usage["prompt_tokens"],
-                            "completion_tokens": usage["completion_tokens"],
-                            "total_tokens": usage["total_tokens"],
-                            "n_ctx": n_ctx,
-                            "elapsed_s": round(time.time() - t0, 2),
-                            "ok": True,
-                        })
+                        on_chunk(
+                            {
+                                "chunk_id": chunk_id,
+                                "chunk_index": len(results) - 1,
+                                "n_total": n_total,
+                                "n_images": len(images_b64),
+                                "prompt_tokens": usage["prompt_tokens"],
+                                "completion_tokens": usage["completion_tokens"],
+                                "total_tokens": usage["total_tokens"],
+                                "n_ctx": n_ctx,
+                                "elapsed_s": round(time.time() - t0, 2),
+                                "ok": True,
+                            }
+                        )
                     except Exception as cb_e:
                         self.logger.warning(f"on_chunk callback failed: {cb_e}")
             except Exception as e:
@@ -278,19 +286,21 @@ NEW_ENTITIES: <comma-separated list like 'E3=red car, E4=brown dog' or 'none'>
                 )
                 if on_chunk is not None:
                     try:
-                        on_chunk({
-                            "chunk_id": chunk_id,
-                            "chunk_index": len(results) - 1,
-                            "n_total": n_total,
-                            "n_images": 0,
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0,
-                            "n_ctx": n_ctx,
-                            "elapsed_s": round(time.time() - t0, 2),
-                            "ok": False,
-                            "error": str(e),
-                        })
+                        on_chunk(
+                            {
+                                "chunk_id": chunk_id,
+                                "chunk_index": len(results) - 1,
+                                "n_total": n_total,
+                                "n_images": 0,
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0,
+                                "n_ctx": n_ctx,
+                                "elapsed_s": round(time.time() - t0, 2),
+                                "ok": False,
+                                "error": str(e),
+                            }
+                        )
                     except Exception:
                         pass
 
@@ -383,7 +393,7 @@ Output ONLY those two lines, nothing else.
             )
 
             # Build this chunk
-            chunk_frames = all_frame_indices[idx: idx + dynamic_chunk_size]
+            chunk_frames = all_frame_indices[idx : idx + dynamic_chunk_size]
 
             t0 = time.time()
             usage: Dict[str, int] = {
@@ -422,9 +432,7 @@ Output ONLY those two lines, nothing else.
                 content = self._extract_content(resp_json)
                 usage = self._extract_usage(resp_json)
 
-                per_frame, summary = self._parse_chunk_response(
-                    content, chunk_frames
-                )
+                per_frame, summary = self._parse_chunk_response(content, chunk_frames)
                 new_entities = self._parse_new_entities(content)
                 entity_registry.update(new_entities)
 
@@ -448,9 +456,8 @@ Output ONLY those two lines, nothing else.
 
                 if actual_prompt > 0 and len(images_b64) > 0:
                     measured_per_image = (
-                        (actual_prompt - prompt_overhead_tokens - entity_tokens_est)
-                        / len(images_b64)
-                    )
+                        actual_prompt - prompt_overhead_tokens - entity_tokens_est
+                    ) / len(images_b64)
                     # Exponential moving average (blend old estimate with new)
                     est_tokens_per_image = int(
                         0.3 * est_tokens_per_image + 0.7 * max(500, measured_per_image)
@@ -475,23 +482,25 @@ Output ONLY those two lines, nothing else.
                 # ── callback ──
                 if on_chunk is not None:
                     try:
-                        on_chunk({
-                            "chunk_id": chunk_id,
-                            "chunk_index": len(results) - 1,
-                            "n_total": n_total_frames,
-                            "n_images": len(images_b64),
-                            "prompt_tokens": actual_prompt,
-                            "completion_tokens": actual_completion,
-                            "total_tokens": actual_total,
-                            "n_ctx": n_ctx,
-                            "cumulative_tokens": cumulative_tokens,
-                            "budget": budget,
-                            "pass_id": pass_id,
-                            "dynamic_chunk_size": dynamic_chunk_size,
-                            "est_tokens_per_image": est_tokens_per_image,
-                            "elapsed_s": round(time.time() - t0, 2),
-                            "ok": True,
-                        })
+                        on_chunk(
+                            {
+                                "chunk_id": chunk_id,
+                                "chunk_index": len(results) - 1,
+                                "n_total": n_total_frames,
+                                "n_images": len(images_b64),
+                                "prompt_tokens": actual_prompt,
+                                "completion_tokens": actual_completion,
+                                "total_tokens": actual_total,
+                                "n_ctx": n_ctx,
+                                "cumulative_tokens": cumulative_tokens,
+                                "budget": budget,
+                                "pass_id": pass_id,
+                                "dynamic_chunk_size": dynamic_chunk_size,
+                                "est_tokens_per_image": est_tokens_per_image,
+                                "elapsed_s": round(time.time() - t0, 2),
+                                "ok": True,
+                            }
+                        )
                     except Exception as cb_e:
                         self.logger.warning(f"on_chunk callback failed: {cb_e}")
 
@@ -529,24 +538,26 @@ Output ONLY those two lines, nothing else.
                 )
                 if on_chunk is not None:
                     try:
-                        on_chunk({
-                            "chunk_id": chunk_id,
-                            "chunk_index": len(results) - 1,
-                            "n_total": n_total_frames,
-                            "n_images": 0,
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0,
-                            "n_ctx": n_ctx,
-                            "cumulative_tokens": cumulative_tokens,
-                            "budget": budget,
-                            "pass_id": pass_id,
-                            "dynamic_chunk_size": dynamic_chunk_size,
-                            "est_tokens_per_image": est_tokens_per_image,
-                            "elapsed_s": round(time.time() - t0, 2),
-                            "ok": False,
-                            "error": str(e),
-                        })
+                        on_chunk(
+                            {
+                                "chunk_id": chunk_id,
+                                "chunk_index": len(results) - 1,
+                                "n_total": n_total_frames,
+                                "n_images": 0,
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0,
+                                "n_ctx": n_ctx,
+                                "cumulative_tokens": cumulative_tokens,
+                                "budget": budget,
+                                "pass_id": pass_id,
+                                "dynamic_chunk_size": dynamic_chunk_size,
+                                "est_tokens_per_image": est_tokens_per_image,
+                                "elapsed_s": round(time.time() - t0, 2),
+                                "ok": False,
+                                "error": str(e),
+                            }
+                        )
                     except Exception:
                         pass
 
@@ -574,9 +585,7 @@ Output ONLY those two lines, nothing else.
         """
         # Build the compaction prompt
         entity_block = self._format_entity_block(entity_registry)
-        summary_text = "\n".join(
-            f"  {i+1}. {s}" for i, s in enumerate(summaries) if s
-        )
+        summary_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(summaries) if s)
         prompt = self.COMPACTION_PROMPT.format(
             segment_summaries=summary_text or "(none)",
             entity_block=entity_block,
@@ -602,7 +611,9 @@ Output ONLY those two lines, nothing else.
             )
 
         except Exception as e:
-            self.logger.warning(f"VLM compaction failed ({e}), using mechanical fallback")
+            self.logger.warning(
+                f"VLM compaction failed ({e}), using mechanical fallback"
+            )
             # Mechanical fallback: last 3 summaries
             compact_seed = "; ".join(summaries[-3:])
             if len(compact_seed) > 300:
@@ -687,7 +698,7 @@ Output ONLY those two lines, nothing else.
                     eq = pair.find("=")
                     if eq > 0:
                         eid = pair[:eq].strip()
-                        desc = pair[eq + 1:].strip()
+                        desc = pair[eq + 1 :].strip()
                         entities[eid] = desc
                 break
         return entities
@@ -716,9 +727,10 @@ Output ONLY those two lines, nothing else.
         try:
             r = requests.get(f"{self.base_url}/props", timeout=5)
             r.raise_for_status()
-            return int(
-                r.json().get("default_generation_settings", {}).get("n_ctx") or 0
-            ) or None
+            return (
+                int(r.json().get("default_generation_settings", {}).get("n_ctx") or 0)
+                or None
+            )
         except Exception:
             return None
 

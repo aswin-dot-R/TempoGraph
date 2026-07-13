@@ -56,6 +56,7 @@ from src.models import DepthResult, DepthFrame
 
 try:
     import torch
+
     _TORCH_AVAILABLE = True
 except ImportError:
     torch = None  # type: ignore[assignment]
@@ -102,15 +103,19 @@ class DepthEstimator:
         try:
             from transformers import pipeline
         except ImportError as e:
-            raise ImportError(
-                "transformers is required for depth estimation"
-            ) from e
+            raise ImportError("transformers is required for depth estimation") from e
 
         repo = self._HF_REPOS.get(self.model_variant, self._HF_REPOS["vits"])
-        self.logger.info(f"Loading Depth Anything V2 ({self.model_variant}) from {repo}")
+        self.logger.info(
+            f"Loading Depth Anything V2 ({self.model_variant}) from {repo}"
+        )
 
         device_arg = (
-            0 if (self.device == "cuda" and _TORCH_AVAILABLE and torch.cuda.is_available()) else -1
+            0
+            if (
+                self.device == "cuda" and _TORCH_AVAILABLE and torch.cuda.is_available()
+            )
+            else -1
         )
         pipe = pipeline("depth-estimation", model=repo, device=device_arg)
         self._model = _DepthAnythingPipelineAdapter(pipe)

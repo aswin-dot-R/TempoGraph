@@ -26,6 +26,7 @@ Span = Tuple[int, int, str]  # (start_ms, end_ms, label)
 
 # ─── span math ────────────────────────────────────────────────────────────────
 
+
 def pad_and_merge(events: Sequence[Span], pad_ms: int = DEFAULT_PAD_MS) -> List[Span]:
     """Pad each (start_ms, end_ms, label) event and merge overlapping spans.
 
@@ -68,6 +69,7 @@ def _ts_to_ms(ts) -> int:
 
 # ─── event selection ──────────────────────────────────────────────────────────
 
+
 def _resolve_run(db) -> Tuple[Path, Path]:
     """Accept a run dir or a tempograph.db path; return (db_path, run_dir)."""
     p = Path(db)
@@ -76,8 +78,9 @@ def _resolve_run(db) -> Tuple[Path, Path]:
     return p, p.parent
 
 
-def _visual_events(run_dir: Path, entity: Optional[str],
-                   behavior: Optional[str]) -> List[Span]:
+def _visual_events(
+    run_dir: Path, entity: Optional[str], behavior: Optional[str]
+) -> List[Span]:
     f = run_dir / "analysis.json"
     if not f.exists():
         return []
@@ -103,8 +106,9 @@ def _visual_events(run_dir: Path, entity: Optional[str],
     return spans
 
 
-def _ethogram_events(db_path: Path, entity: Optional[str],
-                     behavior: Optional[str]) -> List[Span]:
+def _ethogram_events(
+    db_path: Path, entity: Optional[str], behavior: Optional[str]
+) -> List[Span]:
     """Contiguous same-behavior ethogram labels -> (start_ms, end_ms, label).
 
     Ethogram labels are frame-level and not entity-scoped, so they only
@@ -163,6 +167,7 @@ def select_events(
 
 # ─── ffmpeg export ────────────────────────────────────────────────────────────
 
+
 def _slug(label: str, max_len: int = 40) -> str:
     s = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_").lower()
     return s[:max_len] or "event"
@@ -171,9 +176,19 @@ def _slug(label: str, max_len: int = 40) -> str:
 def _ffprobe_duration(path: Path) -> Optional[float]:
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-            capture_output=True, text=True, timeout=30,
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         return float(out.stdout.strip())
     except (subprocess.SubprocessError, ValueError, OSError):
@@ -183,25 +198,52 @@ def _ffprobe_duration(path: Path) -> Optional[float]:
 def _run_ffmpeg(args: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error"] + args,
-        capture_output=True, text=True, timeout=600,
+        capture_output=True,
+        text=True,
+        timeout=600,
     )
 
 
 def _cut_clip(video_path: Path, start_s: float, dur_s: float, out: Path) -> None:
     """Cut one clip: stream-copy first; re-encode when keyframes misalign."""
-    copy_args = ["-ss", f"{start_s:.3f}", "-i", str(video_path),
-                 "-t", f"{dur_s:.3f}", "-c", "copy",
-                 "-avoid_negative_ts", "make_zero", str(out)]
+    copy_args = [
+        "-ss",
+        f"{start_s:.3f}",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{dur_s:.3f}",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(out),
+    ]
     proc = _run_ffmpeg(copy_args)
     if proc.returncode == 0:
         got = _ffprobe_duration(out)
         if got is not None and abs(got - dur_s) <= _DURATION_TOLERANCE_S:
             return
     # Keyframe alignment insufficient (or copy failed) — accurate re-encode.
-    enc_args = ["-ss", f"{start_s:.3f}", "-i", str(video_path),
-                "-t", f"{dur_s:.3f}",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-c:a", "aac", str(out)]
+    enc_args = [
+        "-ss",
+        f"{start_s:.3f}",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{dur_s:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        str(out),
+    ]
     proc = _run_ffmpeg(enc_args)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed cutting {out.name}: {proc.stderr[-800:]}")
@@ -216,8 +258,9 @@ def _drawtext(label: str) -> str:
     )
 
 
-def _build_montage(clips: List[Path], labels: List[str], out: Path,
-                   fade_s: float = _MONTAGE_FADE_S) -> None:
+def _build_montage(
+    clips: List[Path], labels: List[str], out: Path, fade_s: float = _MONTAGE_FADE_S
+) -> None:
     durations = []
     for c in clips:
         d = _ffprobe_duration(c)
@@ -253,9 +296,20 @@ def _build_montage(clips: List[Path], labels: List[str], out: Path,
 
     for with_labels in (True, False):
         args = inputs + [
-            "-filter_complex", _filtergraph(with_labels),
-            "-map", "[vout]", "-c:v", "libx264", "-preset", "veryfast",
-            "-crf", "23", "-pix_fmt", "yuv420p", "-an", str(out),
+            "-filter_complex",
+            _filtergraph(with_labels),
+            "-map",
+            "[vout]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            str(out),
         ]
         proc = _run_ffmpeg(args)
         if proc.returncode == 0:

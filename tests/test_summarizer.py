@@ -54,6 +54,7 @@ _FIXTURE_AUDIO = [
 
 # ── tests ───────────────────────────────────────────────────────────────
 
+
 class TestGenerateSummaryWithLLM:
     """With an injectable LLM callable, the summary is whatever the callable returns."""
 
@@ -72,6 +73,7 @@ class TestGenerateSummaryWithLLM:
     def test_fake_callable_receives_prompt(self):
         """The callable should receive a formatted prompt."""
         captured_prompt = []
+
         def capturing_callable(prompt):
             captured_prompt.append(prompt)
             return "ok"
@@ -206,4 +208,5 @@ class TestLlmHealthProbe:
 
     def test_unreachable_url_returns_false(self):
         from ui.pages.Results import _llm_health_probe
+
         assert _llm_health_probe("http://127.0.0.1:1") is False
