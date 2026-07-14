@@ -136,8 +136,8 @@ slider, default 1 fps), computes a per-frame motion delta, and returns:
    the sampled frames.
 2. Calls the whisper.cpp binary:
    ```
-   /home/ashie/whisper.cpp/build/bin/whisper-cli \
-     -m /home/ashie/whisper.cpp/models/ggml-<model>.bin \
+    ~/whisper.cpp/build/bin/whisper-cli \
+      -m ~/whisper.cpp/models/ggml-<model>.bin \
      -f /tmp/audio.wav \
      -oj -of /tmp/audio \
      -dev <gpu_device>      # 0=AMD, 1=NVIDIA, default 1
@@ -341,9 +341,13 @@ for i in range(0, len(vlm_frames), chunk_size):
     chunks.append((len(chunks), vlm_frames[i : i + chunk_size]))
 ```
 
-So 30 VLM frames + chunk_size 10 → 3 chunks. **No interleaving, no
-balancing** — frames stay in time order so the model can describe
-sequences naturally.
+So 30 VLM frames + chunk_size 10 → 3 chunks. Frames stay in time order
+so the model can describe sequences naturally, but the **change-line
+pass** (phase 2 of dense captioning) dispatches all chunks **concurrently**
+across the llama-server's available slots — not sequentially. The initial
+frame-description pass (phase 1) runs as a single serial pass. Seed
+propagation between chunks (the `SUMMARY:` → next chunk's `seed`) still
+flows in time order so narrative context bridges correctly.
 
 #### What goes inside one chunk request
 
@@ -494,6 +498,12 @@ audio transcript (if Stage 1.5 ran), and makes **one final text-only
 call** to the same llama-server (now without images) asking it to
 synthesise everything into the structured `AnalysisResult` JSON schema.
 
+The aggregator **probes the server's `/props` endpoint** at startup to
+discover the per-slot `n_ctx` (the actual context window available on
+the loaded model). It then trims the dense timeline → transcript →
+captions input so the prompt always fits within `n_ctx`, never
+overflowing.
+
 Two paths based on chunk count:
 
 - `len(chunks) <= single_pass_max_chunks` (default 30) — flatten all
@@ -502,7 +512,7 @@ Two paths based on chunk count:
   partition chunks into groups of `group_size=10`, compress each group's
   summaries to a paragraph via `META_PROMPT`, concatenate the paragraphs,
   then send as the input to the final synthesis call. Keeps very long
-  videos within the 100k context window.
+  videos within the `n_ctx` ceiling reported by `/props`.
 
 Final synthesis prompt (`SINGLE_PASS_PROMPT`):
 
@@ -572,9 +582,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/home/ashie/llama-cpp-turboquant/build/bin/llama-server \
-  -m /home/ashie/.lmstudio/models/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q8_0.gguf \
-  --mmproj /home/ashie/.lmstudio/models/lmstudio-community/Qwen3.5-9B-GGUF/mmproj-Qwen3.5-9B-BF16.gguf \
+ExecStart=<llama-cpp-turboquant>/build/bin/llama-server \
+  -m <lmstudio>/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q8_0.gguf \
+  --mmproj <lmstudio>/Qwen3.5-9B-GGUF/mmproj-Qwen3.5-9B-BF16.gguf \
   -ngl 99 \
   --cache-type-k turbo3 --cache-type-v turbo3 \
   -c 100000 \
@@ -584,7 +594,7 @@ Restart=on-failure
 RestartSec=10
 Environment=HSA_OVERRIDE_GFX_VERSION=12.0.1
 Environment=HIP_VISIBLE_DEVICES=0
-WorkingDirectory=/home/ashie/llama-cpp-turboquant
+WorkingDirectory=<llama-cpp-turboquant>
 
 [Install]
 WantedBy=default.target
@@ -636,7 +646,7 @@ compression (Stage 6 path B) kicks in automatically beyond 30 chunks.
 ### Build
 
 ```bash
-cd /home/ashie/whisper.cpp
+cd ~/whisper.cpp
 cmake -B build -DGGML_VULKAN=1
 cmake --build build -j --config Release
 bash models/download-ggml-model.sh base.en   # one-time per model
@@ -893,7 +903,7 @@ Live progress widgets (in order, top to bottom during a run):
 Equivalent of clicking everything in the UI:
 
 ```bash
-/home/ashie/anaconda3/envs/msd/bin/python -m src.pipeline_v2 \
+python3 -m src.pipeline_v2 \
   --video clip.mp4 \
   --output results/clip.mp4 \
   --camera auto \
@@ -929,7 +939,7 @@ All flags:
 | `--depth` | off | run depth stage |
 | `--audio` | off | run whisper.cpp stage |
 | `--whisper-model` | `base.en` | whisper model |
-| `--whisper-binary` | `/home/ashie/whisper.cpp/build/bin/whisper-cli` | path |
+| `--whisper-binary` | `~/whisper.cpp/build/bin/whisper-cli` | path |
 | `--whisper-gpu-device` | 1 | Vulkan device id |
 | `--whisper-language` | autodetect | force language |
 | `--vlm-fps` | 0.5 | VLM caption FPS (scored mode only) |

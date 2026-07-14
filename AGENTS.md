@@ -1,337 +1,137 @@
-# TempoGraph - Agent Coding Guidelines
+# TempoGraph — Agent Coding Guidelines
 
-## Overview
-
-TempoGraph is a fully-local multimodal video analysis pipeline. It extracts
-temporal behaviors, interactions, audio transcripts, and cross-modal
-correlations from video using YOLO + Depth Anything V2 + Whisper.cpp +
-Qwen3.5-VL (served by llama.cpp), persisted to a per-run SQLite store with
-a Streamlit UI for both running the pipeline and browsing past results.
-
-See `README.md` for a high-level overview and `docs/PIPELINE.md` for the
-deep technical doc with every stage and knob.
-
-## Project Structure
-
-```
-TempoGraph/
-├── src/
-│   ├── pipeline_v2.py        # orchestrator (the only pipeline)
-│   ├── aggregator.py         # chunk → analysis.json
-│   ├── batch_runner.py       # run pipeline over a directory of videos
-│   ├── dataset_exporter.py   # COCO + JSONL dataset export
-│   ├── runtime_estimator.py  # ETA model used by the UI
-│   ├── storage.py            # SQLite schema + helpers
-│   ├── graph_builder.py      # NetworkX → pyvis HTML
-│   ├── json_parser.py        # lenient LLM-JSON extractor
-│   ├── models.py             # Pydantic data models
-│   ├── backends/
-│   │   ├── base.py
-│   │   └── llama_server_backend.py  # → llama.cpp /v1/chat/completions
-│   └── modules/
-│       ├── frame_selector.py        # motion-aware frame sampler
-│       ├── frame_scorer.py          # top-K scorer for VLM frame pick
-│       ├── detector.py              # ultralytics YOLO26
-│       ├── depth.py                 # transformers Depth Anything V2
-│       └── whisper_cpp.py           # subprocess wrapper for whisper.cpp
-├── ui/
-│   ├── app.py                # main pipeline page (Streamlit)
-│   └── pages/Results.py      # results browser (Streamlit)
-├── tests/
-│   ├── test_parser.py     # JSON parser unit tests
-│   └── test_vram_budget.py # VRAM verification test
-├── configs/
-│   └── default.yaml       # Default configuration
-└── requirements.txt       # Python dependencies
-```
-
-## Build, Lint, and Test Commands
-
-### Running Tests
+## Quick Commands
 
 ```bash
-# Run all tests with pytest
-pytest tests/
+# Install
+make install           # pip deps + whisper.cpp + base.en model
+make install-llm       # also: llama.cpp + Qwen3.5-9B (~10 GB)
 
-# Run a single test file
-pytest tests/test_parser.py
+# Run
+make run               # Streamlit UI → http://localhost:8501
+make run-cli VIDEO=clip.mp4   # CLI on one video
 
-# Run a specific test
-pytest tests/test_parser.py::TestJSONParser::test_clean_valid_json
-
-# Run VRAM budget test (requires GPU)
-python tests/test_vram_budget.py
-```
-
-### Code Formatting
-
-```bash
-# Format code with Black (line length 88)
+# Test / lint
+make test              # pytest -v (currently 265 passed)
 black src/ tests/
-
-# Check formatting without modifying
-black --check src/ tests/
-```
-
-### Linting
-
-```bash
-# Lint with flake8
 flake8 src/ tests/
 
-# Lint specific file
-flake8 src/pipeline_v2.py
+# Smoke (no GPU/LVM required)
+make smoke             # CPU smoke test on synthetic 10s video, skip-VLM
 ```
 
-### Running the Pipeline
+Interpreter: `python3` (Python 3.12).
 
-```bash
-# Streamlit UI (the recommended path)
-make run
+## Architecture at a Glance
 
-# CLI on a single video
-make run-cli VIDEO=clip.mp4
-
-# Bulk: process every video in a directory
-python -m src.batch_runner --video-dir videos/ --output-dir results/
-
-# Skip-VLM smoke test (synthetic 10s video)
-make smoke
+```
+source video ──▶ PipelineV2.run() ──▶ results/<name>/
+                        │
+    Stage 1   Frame selection        (src/modules/frame_selector.py)
+    Stage 1.5 Audio transcript       (src/modules/whisper_cpp.py)   [opt-in]
+    Stage 2   YOLO26 detection       (src/modules/detector.py)
+    Stage 3   Depth estimation       (src/modules/depth.py)         [opt-in]
+    Stage 4   Frame scoring          (src/modules/frame_scorer.py)
+    Stage 5   Dense captions (9B)    (src/modules/dense_captioner.py) + EscalationVerifier
+    Stage 6   VLM captioning (chunked)  (src/backends/llama_server_backend.py)
+    Stage 7   Aggregation            (src/aggregator.py)
 ```
 
-### Installation
+**Key files:**
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
+| File | Role |
+|---|---|
+| `src/pipeline_v2.py` | Orchestrator — runs stages sequentially, persists to SQLite, resume-guarded |
+| `src/storage.py` | `TempoGraphDB` — SQLite schema + helpers (WAL + busy_timeout) |
+| `src/aggregator.py` | `CaptionAggregator` — chunks + transcript → `analysis.json` |
+| `src/models.py` | Pydantic models: `Entity`, `VisualEvent`, `AudioEvent`, `AnalysisResult`, `DetectionBox` |
+| `src/settings.py` | `TEMPOGRAPH_*` env vars (zero-dep, re-reads each call) |
+| `src/auto_profile.py` | `probe(path) → VideoFacts` + `derive_plan(facts) → DerivedPlan` |
+| `src/summarizer.py` | `generate_summary()` — injectable LLM callable for narratives |
+| `src/search.py` | FTS5 search over transcript + captions + events (BM25) |
+| `src/highlight_reel.py` | `pick_highlight_spans()` + `build_highlight_reel()` via ffmpeg |
+| `src/clip_export.py` | Graph-driven clip export |
+| `src/annotate.py` | Streamlit-free detection/mask rendering |
+| `src/rle.py` | COCO-style RLE encode/decode (numpy-only) |
+| `ui/app.py` | Main page — three-screen flow: Landing → Plan → Progress |
+| `ui/pages/Results.py` | Results browser — 8+ tabs (Overview, Inspector, VLM, Captions, Timeline, Graph, Clips, Search, etc.) |
+| `ui/live_view.py` | Real-time dense-captioning view |
+| `ui/theme.py` | Dark-first CSS theme |
+| `ui/video_player.py` | Click-to-play video player |
 
-# For development (includes dev dependencies)
-pip install -r requirements.txt pytest black flake8
-```
+**Storage:** Per-run SQLite at `<run_dir>/tempograph.db`. Tables: `frames`, `detections` (+ `mask_rle`), `depth_frames`, `audio_segments`, `run_stages` (resume guards), `ethogram_labels`, `run_meta` (key-value), `frame_captions` (dense captions). Bbox coords normalised to saved JPEG dims (0..1).
 
-## Code Style Guidelines
+**External services:**
+- **llama-server** (Qwen3.5-VL): systemd `--user` unit `qwen-tempograph.service`, port **8082**. Pipeline auto-starts/stops via `systemctl`. Every request passes `chat_template_kwargs: {enable_thinking: false}`.
+- **Ornith 9B walker**: default port **8085** (`TEMPOGRAPH_WALKER_URL`).
+- **EscalationVerifier**: default port **8096** (`TEMPOGRAPH_VERIFIER_URL`).
+- **whisper.cpp**: built at `~/whisper.cpp`, Vulkan backend, default device 1 (NVIDIA).
 
-### General Rules
+## Coding Conventions
 
-- Python 3.9+ required
-- Use type hints for all function parameters and return types
-- Maximum line length: 88 characters (Black default)
-- Use 4 spaces for indentation (no tabs)
+- Python 3.9+, type hints on all functions, 88-char lines (Black).
+- Imports: stdlib → third-party → local (`src.`). Alphabetical within groups.
+- Naming: Classes=PascalCase, functions=snake_case, constants=SCREAMING_SNAKE_CASE.
+- Models: Pydantic v2 in `src/models.py`.
+- Error handling: explicit types, log before raising, handle GPU/CUDA gracefully.
+- GPU cleanup: `gc.collect()` + `torch.cuda.empty_cache()` after model use.
+- Docstrings: Google format, document exceptions.
+- Tests: `pytest` in `tests/`, file `test_*.py`, class `Test*`. `conftest.py` adds project root to `sys.path`.
+- `.flake8`: `max-line-length = 88`, `extend-ignore = E203`.
 
-### Imports
+## VRAM Budget
 
-- Use absolute imports from `src` package
-- Group imports in this order: stdlib, third-party, local
-- Sort imports alphabetically within each group
-
-```python
-# Correct
-import logging
-import time
-from pathlib import Path
-from typing import Optional
-
-import torch
-import yaml
-from pydantic import BaseModel
-
-from src.models import PipelineConfig, AnalysisResult
-from src.modules.detector import ObjectDetector
-```
-
-### Naming Conventions
-
-- **Classes**: PascalCase (e.g., `Pipeline`, `ObjectDetector`)
-- **Functions/variables**: snake_case (e.g., `run_pipeline`, `frame_paths`)
-- **Constants**: SCREAMING_SNAKE_CASE (e.g., `MAX_FRAMES`)
-- **Private methods**: prefix with underscore (e.g., `_run_detection`)
-- **Enum values**: UPPER_SNAKE_CASE for values
-
-### Type Hints
-
-Always use type hints for function signatures:
-
-```python
-def run(self) -> PipelineResult:
-    pass
-
-def _run_detection(self, extraction: ExtractionResult) -> DetectionResult:
-    pass
-
-def process_frame(self, frame: np.ndarray, threshold: float = 0.5) -> Optional[DetectionBox]:
-    pass
-```
-
-### Pydantic Models
-
-Use Pydantic v2 for all data models. Define models in `src/models.py`:
-
-```python
-from pydantic import BaseModel
-from typing import List, Optional
-
-class Entity(BaseModel):
-    id: str
-    type: str
-    description: str
-    first_seen: str
-    last_seen: str
-```
-
-### Error Handling
-
-- Use explicit exception types
-- Add context to error messages
-- Log errors before raising
-- Handle GPU/CUDA errors gracefully
-
-```python
-# Good practice
-def _run_detection(self, extraction: ExtractionResult) -> DetectionResult:
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for detection module")
-    
-    try:
-        detector = ObjectDetector(...)
-        result = detector.detect_frames(extraction.frame_paths)
-    except Exception as e:
-        self.logger.error(f"Detection failed: {e}")
-        raise
-    return result
-```
-
-### Logging
-
-Use the standard logging module:
-
-```python
-import logging
-
-class Pipeline:
-    def __init__(self, config: PipelineConfig):
-        self.logger = logging.getLogger(__name__)
-    
-    def run(self):
-        self.logger.info(f"Starting pipeline: backend={self.config.backend}")
-        self.logger.debug(f"Processing {len(frames)} frames")
-```
-
-### Model Cleanup
-
-Always cleanup GPU resources after use:
-
-```python
-def cleanup(self):
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-```
-
-### Documentation
-
-- Use docstrings for public classes and functions
-- Follow Google docstring format
-- Document exceptions that may be raised
-
-```python
-def analyze_video(self, video_path: str, frames: List[str]) -> AnalysisResult:
-    """Analyze video frames using the VLM backend.
-
-    Args:
-        video_path: Path to input video file.
-        frames: List of extracted frame image paths.
-
-    Returns:
-        AnalysisResult containing detected entities, events, and correlations.
-
-    Raises:
-        RuntimeError: If backend initialization fails.
-    """
-```
-
-### Testing
-
-- Write unit tests using `unittest` or `pytest`
-- Place tests in `tests/` directory
-- Test file naming: `test_*.py`
-- Test class naming: `Test*`
-
-```python
-import unittest
-
-class TestJSONParser(unittest.TestCase):
-    def setUp(self):
-        self.parser = JSONParser(min_confidence=0.3)
-
-    def test_clean_valid_json(self):
-        raw_text = '{"entities": [...]}'
-        result = self.parser.parse(raw_text)
-        self.assertIsInstance(result, AnalysisResult)
-```
-
-### VRAM Budget
-
-The pipeline is designed to fit within 6GB VRAM. Models are loaded sequentially:
+Pipeline fits within 6 GB VRAM via sequential loading:
 
 1. Frame extraction (CPU)
-2. YOLO detection (~0.3GB)
-3. Depth estimation (~0.5GB)
+2. YOLO detection (~0.3 GB)
+3. Depth estimation (~0.5 GB) — opt-in
 4. Unload vision models
-5. Qwen VLM (~2.0GB, 4-bit quantized)
-6. Unload Qwen
-7. Whisper audio (CPU)
+5. Dense captioning (9B VLM, ~0.5 GB) — opt-in
+6. VLM captioning (~2 GB Q4) — external llama-server
+7. Unload VLM
+8. Whisper audio (CPU or Vulkan ~300 MB)
+9. Aggregation (CPU)
 
-When adding new models, ensure they fit within this budget or add a test to verify.
+When adding new models, ensure they fit or add a VRAM verification test.
 
-### Configuration
+## Footguns
 
-- Use `configs/default.yaml` for default settings
-- Use Pydantic models for config validation
-- Support environment variables for API keys
+1. **`depth-anything-v2` PyPI**: `depth-anything-v2>=1.0.0` is unsatisfiable (only 0.1.0 exists). Pipeline uses `transformers.pipeline("depth-estimation", ...)` directly.
+2. **AMD radv `vk::DeviceLostError`**: Whisper defaults to Vulkan device 1 (NVIDIA). Falls back to NVIDIA → CPU.
+3. **Filename = output dir**: same filename overwrites previous run results.
+4. **4 GB Streamlit upload**: `uploaded.read()` holds entire file in RAM. Bootstrap creates `.streamlit/config.toml` with cap.
+5. **Mask persistence**: `mask_rle` column added but seg variant masks not fully wired into all UI paths.
+6. **Pre-2026-04-27 bboxes**: old runs have bboxes normalised against source video dims. Re-run to fix.
+7. **LLM backend URL**: hardcoded `http://127.0.0.1:8082` in summarizer/Results. Should read from config.
+8. **ETA calibration**: `record_stage_timing()` exists but isn't wired into `pipeline_v2.run()`.
 
-```python
-config = PipelineConfig(
-    backend="qwen",
-    modules={"behavior": True, "detection": True, "depth": False, "audio": True},
-    fps=1.0,
-    max_frames=60,
-    confidence=0.5,
-    video_path="video.mp4",
-    output_dir="results"
-)
-```
+## GPU Work Policy
 
-### Git Conventions
+- GPU work only on **CUDA device 0** (RTX 3060) unless explicitly instructed.
+- The AMD 9070 XT serves the Qwen3.5-VL model — **do not allocate memory on it**.
 
-- Create feature branches for new features
-- Write meaningful commit messages
-- Run lint/format before committing:
+## Environment Variables
 
-```bash
-black src/ tests/
-flake8 src/ tests/
-pytest tests/
-```
+| Variable | Default | Description |
+|---|---|---|
+| `TEMPOGRAPH_VLM_URL` | `http://127.0.0.1:8085` | llama-server address for Qwen3.5-VL |
+| `TEMPOGRAPH_VLM_MODEL` | `ornith-1.0-9b-Q4_K_M.gguf` | Model name in model directory |
+| `TEMPOGRAPH_WALKER_URL` | (inherits VLM_URL) | Optional walker service |
+| `TEMPOGRAPH_VERIFIER_URL` | `http://127.0.0.1:8096` | Optional verifier service |
+| `TEMPOGRAPH_WHISPER_BIN` | `~/whisper.cpp/build/bin/whisper-cli` | Path to whisper binary |
+| `TEMPOGRAPH_WHISPER_MODELS` | `~/whisper.cpp/models` | Whisper model directory |
+| `TEMPOGRAPH_RESULTS_DIR` | `results` | Output directory |
 
-### Environment Variables
+## Where to Look Next
 
-```bash
-# Cloud mode
-export GEMINI_API_KEY="your-api-key"
+- `TODO.md` — next tasks, constraints, environment facts
+- `QUEUE.md` — v1.0 ship plan and post-ship backlog
+- `SUMMARY.md` — session-by-session change history, acceptance test outputs
+- `docs/PIPELINE.md` — deep stage-by-stage internals
+- `docs/HARDWARE.md` — per-stage VRAM/runtime breakdown
 
-# Local mode
-export CUDA_VISIBLE_DEVICES=0
-```
+## Git Conventions
 
-### Dependencies
-
-Key dependencies (see `requirements.txt`):
-
-- `torch>=2.0.0` - Deep learning
-- `pydantic>=2.0.0` - Data validation
-- `ultralytics>=8.0.0` - YOLO detection
-- `transformers>=4.35.0` - Qwen model
-- `google-genai>=0.2.0` - Gemini API
-- `streamlit>=1.28.0` - UI framework
-
-When adding dependencies, update `requirements.txt` and verify compatibility with Python 3.9+.
+- Run lint/format before committing: `black src/ tests/ && flake8 src/ tests/ && pytest tests/`
+- Write meaningful commit messages; one commit per logical change minimum.

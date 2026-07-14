@@ -2,10 +2,6 @@
 
 **The fully-local video understanding pipeline: drop in a video, get transcripts, entities, events, a knowledge graph, searchable moments, clips, and highlight reels — no cloud, no API keys, no per-minute fees.**
 
-`![demo](docs/demo.gif)`
-
-> **TODO(human): record 20-30s drop→watch→explore GIF** — drop a clip, run the pipeline, scrub the frame inspector, then explore a result in the Results UI.
-
 Open-source Twelve Labs / Azure Video Indexer on your own GPU.
 
 ---
