@@ -1,0 +1,1104 @@
+"""TempoGraph v2 orchestrator: chunked VLM pipeline backed by SQLite."""
+
+import gc
+import json
+import logging
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
+
+import cv2
+
+try:
+    import torch
+
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
+
+from src.aggregator import CaptionAggregator
+from src.backends.llama_server_backend import LlamaServerBackend
+from src.graph_builder import GraphBuilder
+from src.models import (
+    AnalysisResult,
+    CameraMode,
+    PipelineConfig,
+    PipelineResult,
+)
+from src.modules.depth import DepthEstimator
+from src.modules.detector import ObjectDetector
+from src.modules.dense_captioner import run_dense_captioning
+from src.modules.frame_scorer import FrameScorer
+from src.modules.frame_selector import FrameSelector
+from src.settings import get_settings
+from src.modules.whisper_cpp import (
+    WhisperCppTranscriber,
+    write_segments_to_db,
+    write_transcript_json,
+)
+from src.storage import TempoGraphDB
+
+
+class PipelineV2:
+    def __init__(
+        self,
+        config: PipelineConfig,
+        camera_mode: CameraMode = CameraMode.STATIC,
+        yolo_fps: float = 1.0,
+        vlm_fps: float = 0.5,
+        chunk_size: int = 10,
+        depth_enabled: bool = False,
+        use_segmentation: bool = False,
+        yolo_size: str = "n",
+        threshold_mult: float = 1.0,
+        jpeg_quality: int = 80,
+        frame_max_width: int = 640,
+        skip_vlm: bool = False,
+        vlm_url: str = "http://127.0.0.1:8082",
+        vlm_model: str = "Qwen3.5-9B-Q8_0.gguf",
+        vlm_autostart_service: Optional[str] = None,
+        vlm_autostart_timeout_s: float = 90.0,
+        vlm_autostop: bool = False,
+        vlm_frame_mode: str = "scored",
+        vlm_dedup_threshold: float = 0.92,
+        dense_captions: bool = False,
+        walker_url: str = "http://127.0.0.1:8085",
+        verifier_url: str = "http://127.0.0.1:8096",
+        walker_concurrency: Optional[int] = None,
+        dynamic_chunking: bool = True,
+        context_threshold: float = 0.80,
+        audio_enabled: bool = False,
+        whisper_model: str = "base.en",
+        whisper_binary: Optional[str] = None,
+        whisper_gpu_device: Optional[
+            int
+        ] = 1,  # Vulkan dev 1 = NVIDIA 3060 (radv on AMD has device-lost issues)
+        whisper_language: Optional[str] = None,
+        on_stage: Optional[Callable[[str, str, dict], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ):
+        self.config = config
+        self.camera_mode = camera_mode
+        self.yolo_fps = yolo_fps
+        self.vlm_fps = vlm_fps
+        self.chunk_size = chunk_size
+        self.depth_enabled = depth_enabled
+        self.use_segmentation = use_segmentation
+        if yolo_size not in ("n", "s", "m", "l", "x"):
+            raise ValueError(f"yolo_size must be one of n/s/m/l/x, got {yolo_size!r}")
+        self.yolo_size = yolo_size
+        self.threshold_mult = threshold_mult
+        self.jpeg_quality = jpeg_quality
+        self.frame_max_width = frame_max_width
+        self.skip_vlm = skip_vlm
+        self.vlm_url = vlm_url
+        self.vlm_model = vlm_model
+        self.vlm_autostart_service = vlm_autostart_service
+        self.vlm_autostart_timeout_s = vlm_autostart_timeout_s
+        self.vlm_autostop = vlm_autostop
+        if vlm_frame_mode not in ("scored", "keyframes"):
+            raise ValueError(
+                f"vlm_frame_mode must be 'scored' or 'keyframes', got {vlm_frame_mode!r}"
+            )
+        self.vlm_frame_mode = vlm_frame_mode
+        self.vlm_dedup_threshold = vlm_dedup_threshold
+        self.dense_captions = dense_captions
+        self.walker_url = walker_url
+        self.verifier_url = verifier_url
+        self.walker_concurrency = walker_concurrency
+        self.dynamic_chunking = dynamic_chunking
+        self.context_threshold = context_threshold
+        self.audio_enabled = audio_enabled
+        self.whisper_model = whisper_model
+        self.whisper_binary = whisper_binary
+        self.whisper_gpu_device = whisper_gpu_device
+        self.whisper_language = whisper_language
+        self._on_stage = on_stage
+        self._cancel_event = cancel_event
+        self.logger = logging.getLogger(__name__)
+
+    def _stage(self, name: str, event: str = "start", **info) -> None:
+        # Check for cancellation between stages
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise KeyboardInterrupt(f"Pipeline cancelled before {name} ({event})")
+        if self._on_stage is None:
+            return
+        try:
+            self._on_stage(name, event, info)
+        except Exception as e:
+            self.logger.warning(f"on_stage callback failed: {e}")
+
+    def _ensure_vlm_ready(self, backend) -> None:
+        """If the VLM server is down and a service is configured, start it and poll."""
+        if backend.is_available():
+            return
+        if not self.vlm_autostart_service:
+            self._stage(
+                "VLM captioning",
+                "error",
+                error=f"llama-server not reachable at {self.vlm_url}",
+            )
+            raise RuntimeError(
+                f"VLM server not reachable at {self.vlm_url}. "
+                "Start your llama-server VLM or point TEMPOGRAPH_VLM_URL at it."
+            )
+
+        self._stage("VLM autostart", "start", service=self.vlm_autostart_service)
+        t0 = time.time()
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "start", self.vlm_autostart_service],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+        ) as e:
+            self._stage("VLM autostart", "error", error=str(e))
+            raise RuntimeError(
+                f"Failed to start {self.vlm_autostart_service}: {e}"
+            ) from e
+
+        deadline = t0 + self.vlm_autostart_timeout_s
+        while time.time() < deadline:
+            if backend.is_available():
+                self._stage(
+                    "VLM autostart",
+                    "done",
+                    elapsed_s=round(time.time() - t0, 2),
+                )
+                return
+            time.sleep(1.0)
+
+        self._stage(
+            "VLM autostart",
+            "error",
+            error=f"timeout after {self.vlm_autostart_timeout_s}s",
+        )
+        raise RuntimeError(
+            f"{self.vlm_autostart_service} did not become reachable at "
+            f"{self.vlm_url} within {self.vlm_autostart_timeout_s}s"
+        )
+
+    def run(self) -> PipelineResult:
+        start = time.time()
+        out_dir = Path(self.config.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        db = TempoGraphDB(out_dir / "tempograph.db")
+        self.db_path = out_dir / "tempograph.db"
+        try:
+            # Remember the source video so post-hoc tools (e.g. clip
+            # export) can find it without user input.
+            try:
+                db.set_meta("video_path", str(self.config.video_path))
+            except Exception as e:
+                self.logger.warning(f"could not persist video_path: {e}")
+            # Declare variables used across stages
+            frame_paths: List[Path] = []
+            selection: dict = {}
+            vlm_frames: List[int] = []
+            chunk_caps: list = []
+            saved_w, saved_h = 0, 0
+            video_fps = 30.0
+
+            # ── Stage 1: Frame selection + JPEG export ───────────────────
+            self._stage("Frame selection", "start")
+            if db.is_stage_complete("Frame selection"):
+                self.logger.info("Skipping completed stage: Frame selection")
+                self._stage("Frame selection", "skipped", reason="resumed from DB")
+                frame_paths = self._load_frame_paths_from_db(db, out_dir)
+                selection = self._load_selection_from_db(db)
+                # Reconstruct saved dims from first frame
+                if frame_paths:
+                    _saved = cv2.imread(str(frame_paths[0]))
+                    if _saved is not None:
+                        saved_h, saved_w = _saved.shape[:2]
+            else:
+                t0 = time.time()
+
+                def _frame_scan_progress(info: dict) -> None:
+                    self._stage("Frame selection", "progress", **info)
+
+                raw_selection = FrameSelector().select(
+                    video_path=self.config.video_path,
+                    camera_mode=self.camera_mode,
+                    sample_fps=self.yolo_fps,
+                    threshold_mult=self.threshold_mult,
+                    on_progress=_frame_scan_progress,
+                )
+                frame_paths = self._extract_and_save_frames(
+                    raw_selection.frame_indices, out_dir / "frames"
+                )
+                video_fps, w, h = self._video_meta(self.config.video_path)
+                if frame_paths:
+                    _saved = cv2.imread(str(frame_paths[0]))
+                    saved_h, saved_w = _saved.shape[:2]
+                else:
+                    saved_w, saved_h = w, h
+                for idx, path in zip(raw_selection.frame_indices, frame_paths):
+                    ts_ms = int(idx * 1000.0 / max(video_fps, 1.0))
+                    db.insert_frame(
+                        frame_idx=idx,
+                        timestamp_ms=ts_ms,
+                        image_path=str(path),
+                        is_keyframe=(idx in set(raw_selection.keyframe_indices)),
+                        delta_score=self._delta_for_index(raw_selection, idx),
+                    )
+                self._stage(
+                    "Frame selection",
+                    "done",
+                    elapsed_s=round(time.time() - t0, 2),
+                    frames=len(raw_selection.frame_indices),
+                    keyframes=len(raw_selection.keyframe_indices),
+                )
+                db.mark_stage_complete(
+                    "Frame selection",
+                    elapsed_s=round(time.time() - t0, 2),
+                    n_units=len(raw_selection.frame_indices),
+                )
+                # Normalize selection to a dict for downstream stages
+                selection = {
+                    "frame_indices": list(raw_selection.frame_indices),
+                    "keyframe_indices": list(raw_selection.keyframe_indices),
+                    "scan_indices": list(raw_selection.scan_indices),
+                    "deltas": list(raw_selection.deltas),
+                    "threshold": raw_selection.threshold,
+                }
+
+            # ── Stage 1.5: Audio transcription (optional) ───────────────
+            if self.audio_enabled:
+                self._stage(
+                    "Audio transcription",
+                    "start",
+                    model=self.whisper_model,
+                    gpu_device=self.whisper_gpu_device,
+                )
+                if db.is_stage_complete("Audio transcription"):
+                    self.logger.info("Skipping completed stage: Audio transcription")
+                    self._stage(
+                        "Audio transcription",
+                        "skipped",
+                        reason="resumed from DB",
+                    )
+                else:
+                    t0 = time.time()
+                    try:
+                        binary = self.whisper_binary or get_settings().whisper_binary
+                        transcriber = WhisperCppTranscriber(
+                            binary=binary,
+                            model=self.whisper_model,
+                            gpu_device=self.whisper_gpu_device,
+                            language=self.whisper_language,
+                        )
+                        segments = transcriber.transcribe_video(self.config.video_path)
+                        write_segments_to_db(db, segments)
+                        write_transcript_json(out_dir, segments)
+                        self._stage(
+                            "Audio transcription",
+                            "done",
+                            elapsed_s=round(time.time() - t0, 2),
+                            segments=len(segments),
+                            chars=sum(len(s.text) for s in segments),
+                        )
+                        db.mark_stage_complete(
+                            "Audio transcription",
+                            elapsed_s=round(time.time() - t0, 2),
+                            n_units=len(segments),
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Audio transcription failed: {e}")
+                        self._stage("Audio transcription", "error", error=str(e))
+            else:
+                self._stage("Audio transcription", "skipped")
+
+            # ── Stage 2: YOLO sweep ─────────────────────────────────────
+            self._stage(
+                "YOLO detection",
+                "start",
+                model=(
+                    f"yolo26{self.yolo_size}-seg.pt"
+                    if self.use_segmentation
+                    else f"yolo26{self.yolo_size}.pt"
+                ),
+                frames=len(frame_paths),
+            )
+            if db.is_stage_complete("YOLO detection"):
+                self.logger.info("Skipping completed stage: YOLO detection")
+                self._stage("YOLO detection", "skipped", reason="resumed from DB")
+            else:
+                t0 = time.time()
+                model_path = (
+                    f"yolo26{self.yolo_size}-seg.pt"
+                    if self.use_segmentation
+                    else f"yolo26{self.yolo_size}.pt"
+                )
+                detector = ObjectDetector(
+                    model_path=model_path,
+                    confidence=self.config.confidence,
+                    device=(
+                        "cuda"
+                        if (_TORCH_AVAILABLE and torch.cuda.is_available())
+                        else "cpu"
+                    ),
+                )
+
+                def _yolo_progress(info: dict) -> None:
+                    self._stage("YOLO detection", "progress", **info)
+
+                detector.detect_to_db(
+                    frame_indices=selection["frame_indices"],
+                    frame_paths=frame_paths,
+                    db=db,
+                    frame_width=saved_w,
+                    frame_height=saved_h,
+                    on_progress=_yolo_progress,
+                )
+                detector.cleanup()
+                gc.collect()
+                if _TORCH_AVAILABLE and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                det_count = db.count_detections()
+                self._stage(
+                    "YOLO detection",
+                    "done",
+                    elapsed_s=round(time.time() - t0, 2),
+                    detections=det_count,
+                )
+                db.mark_stage_complete(
+                    "YOLO detection",
+                    elapsed_s=round(time.time() - t0, 2),
+                    n_units=det_count,
+                )
+
+            # ── Stage 2.5: Dense captions (optional) ────────────────────
+            if self.dense_captions:
+                self._stage("Dense captions", "start")
+                if db.is_stage_complete("Dense captions"):
+                    self.logger.info("Skipping completed stage: Dense captions")
+                    self._stage(
+                        "Dense captions",
+                        "skipped",
+                        reason="resumed from DB",
+                    )
+                else:
+                    t0 = time.time()
+                    try:
+                        counts = run_dense_captioning(
+                            db_path=self.db_path,
+                            walker_url=self.walker_url,
+                            verifier_url=self.verifier_url,
+                            on_progress=lambda info: self._stage(
+                                "Dense captions", "progress", **info
+                            ),
+                            cancel_event=self._cancel_event,
+                            concurrency=self.walker_concurrency,
+                        )
+                        walker_counts = counts.get("walker", {})
+                        captioned = walker_counts.get("captioned", 0)
+                        skipped = walker_counts.get("skipped", 0)
+                        escalated = walker_counts.get("escalated", 0)
+                        errors = walker_counts.get("errors", 0)
+                        if captioned + skipped == 0 and errors > 0:
+                            # Every frame failed (e.g. VLM server down):
+                            # do NOT mark complete, so resume retries.
+                            self._stage(
+                                "Dense captions",
+                                "error",
+                                error=f"all {errors} caption requests failed",
+                            )
+                        else:
+                            self._stage(
+                                "Dense captions",
+                                "done",
+                                elapsed_s=round(time.time() - t0, 2),
+                                captioned=captioned,
+                                escalated=escalated,
+                            )
+                            db.mark_stage_complete(
+                                "Dense captions",
+                                elapsed_s=round(time.time() - t0, 2),
+                                n_units=captioned,
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Dense captions failed: {e}")
+                        self._stage("Dense captions", "error", error=str(e))
+            else:
+                self._stage("Dense captions", "skipped")
+
+            # ── Stage 3: Depth estimation (optional) ────────────────────
+            if self.depth_enabled:
+                self._stage("Depth estimation", "start", frames=len(frame_paths))
+                if db.is_stage_complete("Depth estimation"):
+                    self.logger.info("Skipping completed stage: Depth estimation")
+                    self._stage(
+                        "Depth estimation",
+                        "skipped",
+                        reason="resumed from DB",
+                    )
+                else:
+                    t0 = time.time()
+                    try:
+                        depth = DepthEstimator(
+                            device=(
+                                "cuda"
+                                if (_TORCH_AVAILABLE and torch.cuda.is_available())
+                                else "cpu"
+                            )
+                        )
+                        depth.estimate_to_db(
+                            frame_indices=selection["frame_indices"],
+                            frame_paths=frame_paths,
+                            db=db,
+                            output_dir=str(out_dir / "depth"),
+                        )
+                        depth.cleanup()
+                        gc.collect()
+                        if _TORCH_AVAILABLE and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        self._stage(
+                            "Depth estimation",
+                            "done",
+                            elapsed_s=round(time.time() - t0, 2),
+                        )
+                        db.mark_stage_complete(
+                            "Depth estimation",
+                            elapsed_s=round(time.time() - t0, 2),
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Depth estimation failed: {e}")
+                        self._stage("Depth estimation", "error", error=str(e))
+            else:
+                self._stage("Depth estimation", "skipped")
+
+            # ── Stage 4: Frame scoring ──────────────────────────────────
+            self._stage("Frame scoring", "start", mode=self.vlm_frame_mode)
+            if db.is_stage_complete("Frame scoring"):
+                self.logger.info("Skipping completed stage: Frame scoring")
+                self._stage("Frame scoring", "skipped", reason="resumed from DB")
+                vlm_frames = self._load_vlm_frames(db)
+                self._stage(
+                    "Frame scoring",
+                    "skipped_info",
+                    vlm_frames=len(vlm_frames),
+                )
+            else:
+                t0 = time.time()
+                if self.vlm_frame_mode == "keyframes":
+                    kfs = sorted(set(selection["keyframe_indices"]))
+                    if kfs:
+                        vlm_frames = kfs
+                        fallback_used = False
+                    else:
+                        self.logger.warning(
+                            "vlm_frame_mode=keyframes but FrameSelector "
+                            "returned 0 keyframes; falling back to all "
+                            "sampled frames."
+                        )
+                        vlm_frames = list(selection["frame_indices"])
+                        fallback_used = True
+                    self._stage(
+                        "Frame scoring",
+                        "done",
+                        elapsed_s=round(time.time() - t0, 2),
+                        mode="keyframes",
+                        vlm_frames=len(vlm_frames),
+                        fallback_used=fallback_used,
+                    )
+                else:
+                    video_duration = max(
+                        1.0, self._video_duration(self.config.video_path)
+                    )
+                    k = max(1, int(round(video_duration * self.vlm_fps)))
+                    scorer = FrameScorer(db)
+                    vlm_frames = scorer.score_and_select(
+                        candidate_frame_indices=selection["frame_indices"],
+                        keyframe_indices=set(selection["keyframe_indices"]),
+                        k=k,
+                    )
+                    self._stage(
+                        "Frame scoring",
+                        "done",
+                        elapsed_s=round(time.time() - t0, 2),
+                        mode="scored",
+                        vlm_frames=len(vlm_frames),
+                    )
+                self._save_vlm_frames(db, vlm_frames)
+                db.mark_stage_complete(
+                    "Frame scoring",
+                    elapsed_s=round(time.time() - t0, 2),
+                    n_units=len(vlm_frames),
+                )
+
+            # ── Stage 4.5: VLM dedup ────────────────────────────────────
+            if (
+                self.vlm_dedup_threshold > 0
+                and len(vlm_frames) > 1
+                and not db.is_stage_complete("VLM dedup")
+            ):
+                t0 = time.time()
+                pre_dedup = len(vlm_frames)
+                vlm_frames = self._deduplicate_vlm_frames(
+                    vlm_frames,
+                    out_dir / "frames",
+                    keyframe_indices=set(selection["keyframe_indices"]),
+                )
+                dropped = pre_dedup - len(vlm_frames)
+                self._save_vlm_frames(db, vlm_frames)
+                if dropped:
+                    self.logger.info(
+                        f"VLM dedup: {pre_dedup} → {len(vlm_frames)} "
+                        f"(dropped {dropped} redundant frames, "
+                        f"threshold={self.vlm_dedup_threshold})"
+                    )
+                    self._stage(
+                        "VLM dedup",
+                        "done",
+                        before=pre_dedup,
+                        after=len(vlm_frames),
+                        dropped=dropped,
+                        threshold=self.vlm_dedup_threshold,
+                    )
+                db.mark_stage_complete(
+                    "VLM dedup",
+                    elapsed_s=round(time.time() - t0, 2),
+                    n_units=len(vlm_frames),
+                )
+            elif (
+                self.vlm_dedup_threshold > 0
+                and len(vlm_frames) > 1
+                and db.is_stage_complete("VLM dedup")
+            ):
+                vlm_frames = self._load_vlm_frames(db)
+                self.logger.info(
+                    "VLM dedup: loaded %d frames from resume",
+                    len(vlm_frames),
+                )
+
+            if self.skip_vlm:
+                self._stage("VLM captioning", "skipped", reason="skip_vlm flag")
+                self._stage("Aggregation", "skipped", reason="skip_vlm flag")
+                self.logger.info(
+                    "Skipping VLM stages (skip_vlm=True). "
+                    "Stopped after frame scoring."
+                )
+                elapsed = time.time() - start
+                return PipelineResult(
+                    analysis=None,
+                    detection=None,
+                    depth=None,
+                    config=self.config,
+                    annotated_video_path=None,
+                    processing_time=elapsed,
+                )
+
+            # ── Stage 5: Chunked VLM captioning ─────────────────────────
+            self._stage(
+                "VLM captioning",
+                "start",
+                vlm_url=self.vlm_url,
+                vlm_model=self.vlm_model,
+                dynamic_chunking=self.dynamic_chunking,
+                context_threshold=self.context_threshold,
+            )
+            if db.is_stage_complete("VLM captioning"):
+                self.logger.info("Skipping completed stage: VLM captioning")
+                self._stage("VLM captioning", "skipped", reason="resumed from DB")
+            else:
+                t0 = time.time()
+                backend = LlamaServerBackend(
+                    base_url=self.vlm_url, model=self.vlm_model
+                )
+                self._ensure_vlm_ready(backend)
+
+                def _chunk_cb(info: dict) -> None:
+                    self._stage("VLM chunk", "done", **info)
+
+                if self.dynamic_chunking:
+                    chunk_caps = backend.caption_frames_dynamic(
+                        all_frame_indices=vlm_frames,
+                        db=db,
+                        chunk_size_hint=self.chunk_size,
+                        context_threshold=self.context_threshold,
+                        on_chunk=_chunk_cb,
+                    )
+                else:
+                    chunks: List[Tuple[int, List[int]]] = []
+                    for i in range(0, len(vlm_frames), self.chunk_size):
+                        chunks.append(
+                            (len(chunks), vlm_frames[i : i + self.chunk_size])
+                        )
+                    chunk_caps = backend.caption_chunks(
+                        chunks=chunks,
+                        db=db,
+                        on_chunk=_chunk_cb,
+                    )
+                try:
+                    with open(out_dir / "chunks.json", "w") as f:
+                        json.dump(
+                            [
+                                {
+                                    "chunk_id": c.chunk_id,
+                                    "frame_indices": list(c.frame_indices),
+                                    "per_frame_lines": {
+                                        str(k): v for k, v in c.per_frame_lines.items()
+                                    },
+                                    "summary": c.summary,
+                                    "raw_response": c.raw_response,
+                                }
+                                for c in chunk_caps
+                            ],
+                            f,
+                            indent=2,
+                        )
+                except Exception as e:
+                    self.logger.warning(f"failed to write chunks.json: {e}")
+                self._stage(
+                    "VLM captioning",
+                    "done",
+                    elapsed_s=round(time.time() - t0, 2),
+                    non_empty_chunks=sum(1 for c in chunk_caps if c.summary),
+                )
+                db.mark_stage_complete(
+                    "VLM captioning",
+                    elapsed_s=round(time.time() - t0, 2),
+                    n_units=len(chunk_caps),
+                )
+
+            # ── Stage 6: Aggregation ────────────────────────────────────
+            self._stage("Aggregation", "start")
+            if db.is_stage_complete("Aggregation"):
+                self.logger.info("Skipping completed stage: Aggregation")
+                self._stage("Aggregation", "skipped", reason="resumed from DB")
+            else:
+                t0 = time.time()
+                transcript_segments = (
+                    db.get_audio_segments() if self.audio_enabled else []
+                )
+
+                def _agg_cb(info: dict) -> None:
+                    self._stage("Aggregator call", "done", **info)
+
+                analysis = CaptionAggregator(
+                    base_url=self.vlm_url, model=self.vlm_model
+                ).aggregate(
+                    chunk_caps,
+                    transcript_segments=transcript_segments,
+                    on_call=_agg_cb,
+                    db_path=self.db_path,
+                )
+                self._stage(
+                    "Aggregation",
+                    "done",
+                    elapsed_s=round(time.time() - t0, 2),
+                    entities=len(analysis.entities),
+                    events=len(analysis.visual_events),
+                )
+                db.mark_stage_complete(
+                    "Aggregation",
+                    elapsed_s=round(time.time() - t0, 2),
+                    n_units=len(analysis.entities),
+                )
+
+                # Build graph + persist
+                graph = GraphBuilder()
+                graph.build(analysis)
+                try:
+                    graph.to_pyvis_html(str(out_dir / "graph.html"))
+                except Exception as e:
+                    self.logger.warning(f"graph html failed: {e}")
+                # Post-process to include dense_timeline if present
+                _dump = analysis.model_dump()
+                if hasattr(analysis, "dense_timeline"):
+                    _dump["dense_timeline"] = analysis.dense_timeline  # type: ignore[attr-defined]
+                with open(out_dir / "analysis.json", "w") as f:
+                    json.dump(_dump, f, indent=2)
+
+                elapsed = time.time() - start
+                return PipelineResult(
+                    analysis=analysis,
+                    detection=None,
+                    depth=None,
+                    config=self.config,
+                    annotated_video_path=None,
+                    processing_time=elapsed,
+                )
+
+            # If Aggregation was resumed, load existing analysis.json
+            analysis_path = out_dir / "analysis.json"
+            if analysis_path.exists():
+                try:
+                    import json as _json
+
+                    raw = _json.loads(analysis_path.read_text())
+                    analysis = AnalysisResult.model_validate(raw)
+                    elapsed = time.time() - start
+                    return PipelineResult(
+                        analysis=analysis,
+                        detection=None,
+                        depth=None,
+                        config=self.config,
+                        annotated_video_path=None,
+                        processing_time=elapsed,
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"could not validate analysis.json at {analysis_path}: {e}"
+                    )
+
+            elapsed = time.time() - start
+            return PipelineResult(
+                analysis=None,
+                detection=None,
+                depth=None,
+                config=self.config,
+                annotated_video_path=None,
+                processing_time=elapsed,
+            )
+        finally:
+            db.close()
+            self._maybe_stop_vlm_service()
+
+    def _maybe_stop_vlm_service(self) -> None:
+        if not self.vlm_autostop or not self.vlm_autostart_service:
+            return
+        self._stage("VLM autostop", "start", service=self.vlm_autostart_service)
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "stop", self.vlm_autostart_service],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self._stage("VLM autostop", "done")
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+        ) as e:
+            self.logger.warning(f"failed to stop {self.vlm_autostart_service}: {e}")
+            self._stage("VLM autostop", "error", error=str(e))
+
+    # ── resume helpers ────────────────────────────────────────────────
+
+    def _load_frame_paths_from_db(self, db: TempoGraphDB, out_dir: Path) -> List[Path]:
+        """Reconstruct saved frame paths from the frames table."""
+        rows = db._conn.execute(
+            "SELECT image_path FROM frames ORDER BY frame_idx ASC"
+        ).fetchall()
+        return [Path(r["image_path"]) for r in rows]
+
+    def _load_selection_from_db(self, db: TempoGraphDB) -> dict:
+        """Reconstruct a minimal selection-like object from the DB."""
+        all_indices: List[int] = []
+        keyframe_indices: List[int] = []
+        rows = db._conn.execute(
+            "SELECT frame_idx, is_keyframe FROM frames ORDER BY frame_idx ASC"
+        ).fetchall()
+        for r in rows:
+            all_indices.append(r["frame_idx"])
+            if r["is_keyframe"]:
+                keyframe_indices.append(r["frame_idx"])
+        return {
+            "frame_indices": all_indices,
+            "keyframe_indices": keyframe_indices,
+            "scan_indices": all_indices,
+            "deltas": [0.0] * len(all_indices),
+            "threshold": 0.0,
+        }
+
+    def _save_vlm_frames(self, db: TempoGraphDB, vlm_frames: List[int]) -> None:
+        """Persist vlm_frames for resume."""
+        import json
+
+        db.set_meta("vlm_frames", json.dumps(vlm_frames))
+
+    def _load_vlm_frames(self, db: TempoGraphDB) -> List[int]:
+        """Load vlm_frames from DB for resume."""
+        import json
+
+        raw = db.get_meta("vlm_frames")
+        if raw is None:
+            return []
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def _video_meta(self, path: str) -> Tuple[float, int, int]:
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        return fps, w, h
+
+    def _video_duration(self, path: str) -> float:
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return n / fps if fps > 0 else 0.0
+
+    def _delta_for_index(self, selection, idx) -> float:
+        try:
+            i = selection.scan_indices.index(idx)
+            return float(selection.deltas[i])
+        except ValueError:
+            return 0.0
+
+    def _deduplicate_vlm_frames(
+        self,
+        vlm_frames: List[int],
+        frames_dir: Path,
+        keyframe_indices: Optional[set] = None,
+    ) -> List[int]:
+        """Remove visually redundant frames from the VLM set.
+
+        Compares consecutive frames as 64×64 grayscale thumbnails.
+        Drops a frame if its similarity to the previous kept frame
+        exceeds ``vlm_dedup_threshold``.
+
+        Keyframes (motion peaks from FrameSelector) are always preserved
+        regardless of similarity, since they were specifically chosen for
+        being visually distinctive moments.
+        """
+        protected = set(keyframe_indices or ())
+        kept: List[int] = [vlm_frames[0]]
+        prev_thumb = self._load_thumb(frames_dir / f"frame_{vlm_frames[0]:06d}.jpg")
+        if prev_thumb is None:
+            return vlm_frames
+
+        for idx in vlm_frames[1:]:
+            thumb = self._load_thumb(frames_dir / f"frame_{idx:06d}.jpg")
+            if thumb is None:
+                kept.append(idx)
+                continue
+            # Always keep keyframes, even if visually similar to neighbour.
+            if idx in protected:
+                kept.append(idx)
+                prev_thumb = thumb
+                continue
+            diff = cv2.absdiff(prev_thumb, thumb)
+            mean_diff = cv2.mean(diff)[0] / 255.0
+            similarity = 1.0 - mean_diff
+            if similarity < self.vlm_dedup_threshold:
+                kept.append(idx)
+                prev_thumb = thumb
+
+        return kept
+
+    @staticmethod
+    def _load_thumb(path: Path, size=(64, 64)):
+        """Load an image as a small grayscale thumbnail for fast comparison."""
+        img = cv2.imread(str(path))
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, size)
+
+    def _extract_and_save_frames(self, indices, out_dir: Path) -> List[Path]:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cap = cv2.VideoCapture(self.config.video_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        scale = self.frame_max_width / width if width > self.frame_max_width else 1.0
+        paths: List[Path] = []
+        total = len(indices)
+        t0 = time.time()
+
+        self._stage(
+            "Frame export",
+            "start",
+            frames=total,
+            scale=f"{scale:.2f}" if scale < 1.0 else "1.0",
+        )
+
+        # Use set for O(1) lookup
+        index_set = set(indices)
+        max_idx = max(indices) if indices else 0
+        saved = {}
+
+        # Sequential read is much faster than random seek for dense indices
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame_num = 0
+        while frame_num <= max_idx:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_num in index_set:
+                if scale < 1.0:
+                    new_w = int(width * scale)
+                    new_h = int(frame.shape[0] * scale)
+                    frame = cv2.resize(frame, (new_w, new_h))
+                p = out_dir / f"frame_{frame_num:06d}.jpg"
+                cv2.imwrite(
+                    str(p), frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+                )
+                saved[frame_num] = p
+
+                step = len(saved)
+                if step % 50 == 0 or step == total:
+                    elapsed = time.time() - t0
+                    fps = step / max(elapsed, 0.01)
+                    eta = (total - step) / max(fps, 0.1)
+                    self._stage(
+                        "Frame export",
+                        "progress",
+                        step=step,
+                        total=total,
+                        fps=round(fps, 1),
+                        eta_s=round(max(0, eta), 1),
+                    )
+            frame_num += 1
+
+        cap.release()
+
+        # Return paths in the original index order
+        paths = [saved[idx] for idx in indices if idx in saved]
+
+        self._stage(
+            "Frame export",
+            "done",
+            elapsed_s=round(time.time() - t0, 2),
+            saved=len(paths),
+        )
+        return paths
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="TempoGraph v2 pipeline")
+    parser.add_argument("--video", required=True)
+    parser.add_argument("--output", default="results/v2_run")
+    parser.add_argument(
+        "--camera", default="static", choices=["static", "moving", "auto"]
+    )
+    parser.add_argument("--yolo-fps", type=float, default=1.0)
+    parser.add_argument("--vlm-fps", type=float, default=0.5)
+    parser.add_argument("--chunk-size", type=int, default=10)
+    parser.add_argument("--depth", action="store_true")
+    parser.add_argument(
+        "--seg",
+        action="store_true",
+        help="Use the seg variant (yolo26<size>-seg.pt) "
+        "instead of the bbox-only model.",
+    )
+    parser.add_argument(
+        "--yolo-size",
+        choices=["n", "s", "m", "l", "x"],
+        default="n",
+        help="YOLO26 model size: n (nano, fastest) → x (xlarge, "
+        "most accurate). Larger = more VRAM and slower.",
+    )
+    parser.add_argument("--skip-vlm", action="store_true")
+    parser.add_argument("--confidence", type=float, default=0.5)
+    parser.add_argument("--threshold-mult", type=float, default=1.0)
+    parser.add_argument("--vlm-url", default=get_settings().vlm_url)
+    parser.add_argument("--vlm-model", default=get_settings().vlm_model)
+    parser.add_argument(
+        "--vlm-autostart-service",
+        default=None,
+        help="systemd --user unit to auto-start if VLM is unreachable",
+    )
+    parser.add_argument(
+        "--vlm-autostop",
+        action="store_true",
+        help="systemctl --user stop the autostart service when the pipeline finishes",
+    )
+    parser.add_argument(
+        "--vlm-frame-mode",
+        choices=["scored", "keyframes"],
+        default="scored",
+        help="scored: top-K by FrameScorer at --vlm-fps (default). "
+        "keyframes: only motion-detected keyframes from FrameSelector "
+        "(--vlm-fps ignored).",
+    )
+    parser.add_argument(
+        "--vlm-dedup-threshold",
+        type=float,
+        default=0.92,
+        help="Similarity threshold for VLM frame dedup "
+        "(0.0–1.0, higher = more aggressive). "
+        "Set to 0 to disable. Default 0.92.",
+    )
+    parser.add_argument(
+        "--audio", action="store_true", help="Transcribe audio with whisper.cpp"
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default="base.en",
+        help="ggml model name (tiny.en/base.en/small.en/medium.en/large-v3)",
+    )
+    parser.add_argument(
+        "--whisper-binary",
+        default=None,
+        help="Path to whisper-cli binary (default: TEMPOGRAPH_WHISPER_BIN or ~/whisper.cpp/build/bin/whisper-cli)",
+    )
+    parser.add_argument(
+        "--whisper-gpu-device",
+        type=int,
+        default=1,
+        help="Vulkan device index. Default 1 = NVIDIA 3060 "
+        "(0 = AMD 9070 XT but radv has occasional device-lost errors).",
+    )
+    parser.add_argument(
+        "--whisper-language",
+        default=None,
+        help="Force language (e.g. 'en'); default = auto-detect",
+    )
+    parser.add_argument(
+        "--dense-captions",
+        action="store_true",
+        help="Per-frame dense captioning (walker + escalation verifier)",
+    )
+    args = parser.parse_args()
+
+    config = PipelineConfig(
+        backend="llama-server",
+        modules={
+            "behavior": True,
+            "detection": True,
+            "depth": args.depth,
+            "audio": False,
+        },
+        fps=args.yolo_fps,
+        max_frames=999,
+        confidence=args.confidence,
+        video_path=args.video,
+        output_dir=args.output,
+    )
+    pipe = PipelineV2(
+        config,
+        camera_mode=CameraMode(args.camera),
+        yolo_fps=args.yolo_fps,
+        vlm_fps=args.vlm_fps,
+        chunk_size=args.chunk_size,
+        depth_enabled=args.depth,
+        use_segmentation=args.seg,
+        yolo_size=args.yolo_size,
+        threshold_mult=args.threshold_mult,
+        skip_vlm=args.skip_vlm,
+        vlm_url=args.vlm_url,
+        vlm_model=args.vlm_model,
+        vlm_autostart_service=args.vlm_autostart_service,
+        vlm_autostop=args.vlm_autostop,
+        vlm_frame_mode=args.vlm_frame_mode,
+        vlm_dedup_threshold=args.vlm_dedup_threshold,
+        audio_enabled=args.audio,
+        whisper_model=args.whisper_model,
+        whisper_binary=args.whisper_binary,
+        whisper_gpu_device=args.whisper_gpu_device,
+        whisper_language=args.whisper_language,
+        dense_captions=args.dense_captions,
+    )
+    result = pipe.run()
+    print(f"Done in {result.processing_time:.1f}s -> {args.output}")

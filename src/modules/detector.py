@@ -35,12 +35,19 @@ VRAM management:
 """
 
 import time
-import torch
 import gc
 import logging
 from pathlib import Path
 from typing import List, Optional
 from src.models import DetectionResult, DetectionBox
+
+try:
+    import torch
+
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
 
 class ObjectDetector:
@@ -75,7 +82,7 @@ class ObjectDetector:
         self._model = YOLO(self.model_path)
 
         # Move to device
-        if self.device == "cuda" and torch.cuda.is_available():
+        if self.device == "cuda" and _TORCH_AVAILABLE and torch.cuda.is_available():
             self._model.to(self.device)
             self.logger.info("YOLO model loaded on CUDA")
 
@@ -152,7 +159,9 @@ class ObjectDetector:
                 self.logger.warning(f"Error processing frame {frame_idx}: {e}")
                 continue
 
-        avg_time_ms = (total_inference_time / len(frame_paths)) * 1000 if frame_paths else 0
+        avg_time_ms = (
+            (total_inference_time / len(frame_paths)) * 1000 if frame_paths else 0
+        )
         self.logger.info(
             f"Detection complete: {len(boxes)} detections across {len(frame_paths)} frames "
             f"(avg {avg_time_ms:.1f}ms/frame, total {total_inference_time:.2f}s)"
@@ -163,6 +172,145 @@ class ObjectDetector:
             fps=1.0,
             frame_count=len(frame_paths),
         )
+
+    def detect_to_db(
+        self,
+        frame_indices,
+        frame_paths,
+        db,
+        frame_width: int,
+        frame_height: int,
+        on_progress: "Optional[callable]" = None,
+    ):
+        """Run detection on frames and insert normalized rows into the DB."""
+        self._load_model()
+        total = len(frame_paths)
+        self.logger.info(f"Detect-to-DB: {total} frames")
+        det_count = 0
+        t0 = time.time()
+
+        for step, (frame_idx, frame_path) in enumerate(zip(frame_indices, frame_paths)):
+            try:
+                frame = self._read_frame(frame_path)
+                results = self._model.track(
+                    frame,
+                    conf=self.confidence,
+                    imgsz=self.imgsz,
+                    persist=True,
+                    verbose=False,
+                )
+                if not results:
+                    continue
+                result = results[0]
+                if result.boxes is None or len(result.boxes) == 0:
+                    continue
+
+                track_ids = None
+                if result.boxes.id is not None:
+                    track_ids = result.boxes.id
+
+                # Seg variants attach per-instance masks; encode them to
+                # COCO-style RLE at the saved-frame resolution. `xyn` holds
+                # polygons normalised to the original image, so rasterising
+                # them is alignment-safe regardless of letterbox padding.
+                masks_xyn = None
+                if getattr(result, "masks", None) is not None:
+                    try:
+                        masks_xyn = result.masks.xyn
+                    except Exception as e:
+                        self.logger.warning(
+                            f"could not read masks for frame {frame_idx}: {e}"
+                        )
+
+                for i, box in enumerate(result.boxes):
+                    xyxy = box.xyxy[0]
+                    if hasattr(xyxy, "cpu"):
+                        xyxy = xyxy.cpu().numpy()
+                    x1, y1, x2, y2 = [float(v) for v in xyxy]
+
+                    conf = box.conf[0] if hasattr(box.conf, "__getitem__") else box.conf
+                    conf = float(conf)
+                    cls_idx = (
+                        int(box.cls[0])
+                        if hasattr(box.cls, "__getitem__")
+                        else int(box.cls)
+                    )
+                    class_name = self._model.names[cls_idx]
+
+                    track_id = None
+                    if track_ids is not None and i < len(track_ids):
+                        try:
+                            track_id = int(track_ids[i])
+                        except (TypeError, ValueError):
+                            track_id = None
+
+                    mask_rle = None
+                    if masks_xyn is not None and i < len(masks_xyn):
+                        mask_rle = self._encode_mask_rle(
+                            masks_xyn[i], frame_width, frame_height
+                        )
+
+                    db.insert_detection(
+                        frame_idx=int(frame_idx),
+                        track_id=track_id,
+                        class_name=class_name,
+                        x1=x1 / frame_width,
+                        y1=y1 / frame_height,
+                        x2=x2 / frame_width,
+                        y2=y2 / frame_height,
+                        confidence=conf,
+                        mask_rle=mask_rle,
+                    )
+                    det_count += 1
+            except Exception as e:
+                self.logger.warning(f"detect_to_db error frame {frame_idx}: {e}")
+                continue
+
+            # Progress callback
+            if on_progress is not None:
+                elapsed = time.time() - t0
+                fps = (step + 1) / max(elapsed, 0.01)
+                remaining = total - step - 1
+                eta = remaining / max(fps, 0.1)
+                on_progress(
+                    {
+                        "frame_idx": int(frame_idx),
+                        "step": step + 1,
+                        "total": total,
+                        "detections": det_count,
+                        "fps": round(fps, 1),
+                        "eta_s": round(max(0, eta), 1),
+                        "elapsed_s": round(elapsed, 1),
+                    }
+                )
+
+    def _encode_mask_rle(
+        self, polygon_xyn, frame_width: int, frame_height: int
+    ) -> Optional[str]:
+        """Rasterise one normalised instance polygon and RLE-encode it.
+
+        Returns the JSON string for the ``mask_rle`` column, or None when the
+        polygon is degenerate / rasterisation fails.
+        """
+        try:
+            import cv2
+            import numpy as np
+
+            from src.rle import encode_to_string
+
+            if polygon_xyn is None or len(polygon_xyn) < 3:
+                return None
+            pts = np.round(
+                np.asarray(polygon_xyn, dtype=np.float64) * [frame_width, frame_height]
+            ).astype(np.int32)
+            mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+            cv2.fillPoly(mask, [pts], 1)
+            if not mask.any():
+                return None
+            return encode_to_string(mask)
+        except Exception as e:
+            self.logger.warning(f"mask RLE encode failed: {e}")
+            return None
 
     def _read_frame(self, frame_path: Path) -> Optional[object]:
         """Read frame using OpenCV."""
@@ -181,7 +329,7 @@ class ObjectDetector:
             del self._model
             self._model = None
         gc.collect()
-        if torch.cuda.is_available():
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
             vram_after = torch.cuda.memory_allocated() / 1e9
             self.logger.info(f"VRAM after cleanup: {vram_after:.2f}GB")

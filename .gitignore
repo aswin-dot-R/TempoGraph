@@ -19,6 +19,8 @@ checkpoints/
 *.mov
 *.mkv
 *.wav
+!tests/fixtures/
+!tests/fixtures/sample.mp4
 
 # Results (generated output)
 results/
@@ -64,3 +66,4 @@ config
 hooks/
 objects/
 refs/
+.claude/settings.local.json

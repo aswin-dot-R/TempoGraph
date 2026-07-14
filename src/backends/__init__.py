@@ -1,7 +1,6 @@
-"""Backends package for TempoGraph."""
+"""Backends package for TempoGraph v2."""
 
 from .base import BaseVLMBackend
-from .gemini_backend import GeminiBackend
-from .qwen_backend import QwenBackend
+from .llama_server_backend import LlamaServerBackend
 
-__all__ = ["BaseVLMBackend", "GeminiBackend", "QwenBackend"]
+__all__ = ["BaseVLMBackend", "LlamaServerBackend"]

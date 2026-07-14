@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from typing import List, Optional
 from enum import Enum
+from dataclasses import dataclass, field
 
 
 class BehaviorType(str, Enum):
@@ -118,3 +119,29 @@ class PipelineResult(BaseModel):
     config: Optional[PipelineConfig] = None
     annotated_video_path: Optional[str] = None
     processing_time: float = 0.0
+
+
+class CameraMode(str, Enum):
+    STATIC = "static"
+    MOVING = "moving"
+    AUTO = "auto"
+
+
+@dataclass
+class FrameSelectionResult:
+    frame_indices: List[int]
+    keyframe_indices: List[int]
+    sampled_indices: List[int]
+    scan_indices: List[int]
+    deltas: List[float]
+    threshold: float
+    camera_mode: CameraMode
+
+
+@dataclass
+class ChunkCaption:
+    chunk_id: int
+    frame_indices: List[int]
+    per_frame_lines: dict
+    summary: str
+    raw_response: str

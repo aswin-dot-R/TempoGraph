@@ -1,12 +1,18 @@
-"""Top-level package for TempoGraph."""
+"""Top-level package for TempoGraph v2."""
 
-from . import (
-    models,
-    backends,
-    modules,
-    graph_builder,
-    video_annotator,
-    json_parser,
-    pipeline,
-    api,
-)
+from . import models, json_parser, settings
+
+try:
+    from . import (
+        backends,
+        modules,
+        graph_builder,
+        storage,
+        aggregator,
+        pipeline_v2,
+        runtime_estimator,
+        dataset_exporter,
+        batch_runner,
+    )
+except (ImportError, ModuleNotFoundError):
+    pass

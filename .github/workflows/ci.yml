@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, v2-chunked-pipeline]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest black flake8
+
+      - name: Run pytest
+        run: pytest -q
+
+      - name: Verify Python syntax (all modules)
+        run: |
+          python -c "
+          import py_compile, sys
+          files = [
+              'src/pipeline_v2.py',
+              'src/aggregator.py',
+              'src/storage.py',
+              'src/json_parser.py',
+              'src/models.py',
+              'src/graph_builder.py',
+              'src/dataset_exporter.py',
+              'src/batch_runner.py',
+              'src/runtime_estimator.py',
+              'src/backends/base.py',
+              'src/backends/llama_server_backend.py',
+              'src/modules/frame_selector.py',
+              'src/modules/frame_scorer.py',
+              'src/modules/whisper_cpp.py',
+          ]
+          ok = True
+          for f in files:
+              try:
+                  py_compile.compile(f, doraise=True)
+                  print(f'  OK {f}')
+              except py_compile.PyCompileError as e:
+                  print(f'  FAIL {f}: {e}')
+                  ok = False
+          sys.exit(0 if ok else 1)
+          "

@@ -1,35 +1,41 @@
-FROM nvidia/cuda:12.1-cudnn8-runtime-ubuntu22.04
+# TempoGraph Docker image
+# VLM stays external — set TEMPOGRAPH_VLM_URL=http://your-llm:8085 at docker run.
+# Build whisper.cpp (CPU) inside the image so the pipeline doesn't need the host GPU.
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV DEBIAN_FRONTEND=noninteractive
+FROM python:3.12-slim
 
-# Install Python and pip
-RUN apt-get update && apt-get install -y python3.10 python3.10-venv python3-pip && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# System deps: ffmpeg for video encoding + build tools for whisper.cpp
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ffmpeg \
+    build-essential \
+    git \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user
-RUN useradd --create-home --shell /bin/bash appuser && \
-    chown -R appuser:appuser /home/appuser && \
-    chmod 755 /home/appuser
+# Build whisper.cpp (CPU backend) at /opt/whisper.cpp
+RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper.cpp && \
+    cd /tmp/whisper.cpp && \
+    mkdir -p build && cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DGGML_BACKEND=cpu -DGGML_BLAS=OFF && \
+    make -j"$(nproc)" && \
+    cp whisper-cli /opt/whisper.cpp/build/bin/whisper-cli && \
+    cd / && rm -rf /tmp/whisper.cpp
 
-# Switch to the user
-USER appuser
-WORKDIR /home/appuser
+# Python deps
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN python3.10 -m pip install --upgrade pip && \
-    pip install -r requirements.txt
+# Copy the TempoGraph source
+COPY . /app
 
-# Copy source code and configs
-COPY src/ ./src/
-COPY configs/ ./configs/
-COPY ui/ ./ui/
-COPY tests/ ./tests/
+# Point whisper binary at the CPU build
+ENV TEMPOGRAPH_WHISPER_BIN=/opt/whisper.cpp/build/bin/whisper-cli
 
-# Expose ports
-EXPOSE 8000 8501
+# Streamlit web UI port
+EXPOSE 8501
 
-# Set default command to run both API and UI
-CMD bash -c "uvicorn src.api:app --host 0.0.0.0 --port 8000 & streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0"
+WORKDIR /app
+
+ENTRYPOINT ["streamlit", "run", "ui/app.py"]
