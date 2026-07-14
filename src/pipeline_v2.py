@@ -737,27 +737,21 @@ class PipelineV2:
                 try:
                     import json as _json
 
-                    analysis = _json.loads(analysis_path.read_text())
+                    raw = _json.loads(analysis_path.read_text())
+                    analysis = AnalysisResult.model_validate(raw)
                     elapsed = time.time() - start
                     return PipelineResult(
-                        analysis=type(
-                            "AnalysisResult",
-                            (),
-                            {
-                                "entities": analysis.get("entities", []),
-                                "visual_events": analysis.get("visual_events", []),
-                                "audio_events": analysis.get("audio_events", []),
-                                "summary": analysis.get("summary", ""),
-                            },
-                        )(),
+                        analysis=analysis,
                         detection=None,
                         depth=None,
                         config=self.config,
                         annotated_video_path=None,
                         processing_time=elapsed,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.warning(
+                        f"could not validate analysis.json at {analysis_path}: {e}"
+                    )
 
             elapsed = time.time() - start
             return PipelineResult(

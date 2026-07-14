@@ -294,3 +294,334 @@ class TestResumeSkipsIntermediateStage:
         db.close()
 
         assert result.analysis.summary == "ok"
+
+
+class TestResumeLoadsAnalysisJsonAsPydantic:
+    """When Aggregation is already complete and analysis.json exists, the pipeline
+    must load it into a real AnalysisResult instance, not a duck-typed object.
+    """
+
+    def test_resume_returns_real_analysisresult(self, tmp_path):
+        from src.models import Entity, VisualEvent, AudioEvent, BehaviorType, SoundType
+
+        video = tmp_path / "v.mp4"
+        _make_video(video)
+        out = tmp_path / "out"
+        out.mkdir()
+        frames_dir = out / "frames"
+        frames_dir.mkdir()
+
+        # Pre-mark all stages as complete
+        db = TempoGraphDB(out / "tempograph.db")
+        db.insert_frame(
+            frame_idx=5,
+            timestamp_ms=166,
+            image_path=str(frames_dir / "frame_000005.jpg"),
+            is_keyframe=False,
+            delta_score=0.1,
+        )
+        for stage in [
+            "Frame selection",
+            "Audio transcription",
+            "YOLO detection",
+            "Depth estimation",
+            "Frame scoring",
+            "Dense captions",
+            "VLM captioning",
+            "Aggregation",
+        ]:
+            db.mark_stage_complete(stage, elapsed_s=1.0, n_units=1)
+        db.close()
+
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.imwrite(str(frames_dir / "frame_000005.jpg"), fake_frame)
+
+        config = PipelineConfig(
+            backend="llama-server",
+            modules={
+                "behavior": True,
+                "detection": True,
+                "depth": False,
+                "audio": False,
+            },
+            fps=1.0,
+            max_frames=20,
+            confidence=0.5,
+            video_path=str(video),
+            output_dir=str(out),
+        )
+
+        # Write a valid analysis.json with proper Pydantic-serializable data
+        import json
+
+        sample_data = {
+            "entities": [
+                {
+                    "id": "e1",
+                    "type": "person",
+                    "description": "A person in red shirt",
+                    "first_seen": "00:05",
+                    "last_seen": "00:15",
+                }
+            ],
+            "visual_events": [
+                {
+                    "type": "approach",
+                    "entities": ["e1"],
+                    "start_time": "00:05",
+                    "end_time": "00:10",
+                    "description": "Person approaches table",
+                    "confidence": 0.85,
+                }
+            ],
+            "audio_events": [
+                {
+                    "type": "speech",
+                    "start_time": "00:06",
+                    "end_time": "00:09",
+                    "speaker": " narrator",
+                    "text": "The person sits down.",
+                    "confidence": 0.9,
+                }
+            ],
+            "summary": "Test summary",
+        }
+
+        (out / "analysis.json").write_text(json.dumps(sample_data))
+
+        # Mock out stages that would be skipped anyway
+        with patch("src.pipeline_v2.FrameSelector") as MockFS, patch(
+            "src.pipeline_v2.ObjectDetector"
+        ) as MockDet, patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, patch(
+            "src.pipeline_v2.CaptionAggregator"
+        ) as MockAgg, patch(
+            "src.pipeline_v2.FrameScorer"
+        ) as MockScorer, patch(
+            "src.pipeline_v2.WhisperCppTranscriber"
+        ) as MockWhisper:
+            MockFS.return_value.select.return_value = MagicMock(
+                frame_indices=[5],
+                keyframe_indices=[],
+                scan_indices=[5],
+                deltas=[0.1],
+            )
+            MockDet.return_value.detect_to_db = MagicMock()
+            MockDet.return_value.cleanup = MagicMock()
+            MockLLM.return_value.caption_frames_dynamic = MagicMock(return_value=[])
+            MockAgg.return_value.aggregate = MagicMock(
+                return_value=AnalysisResult(summary="ok")
+            )
+            MockScorer.return_value.score_and_select = MagicMock(return_value=[5])
+            MockWhisper.return_value.transcribe = MagicMock(return_value=[])
+
+            pipeline = PipelineV2(
+                config,
+                camera_mode=CameraMode.STATIC,
+                depth_enabled=False,
+                skip_vlm=False,
+            )
+            result = pipeline.run()
+
+        # The returned analysis must be a real AnalysisResult instance
+        assert isinstance(result.analysis, AnalysisResult)
+        assert result.analysis.summary == "Test summary"
+
+        # Entities must be real Entity instances, not dicts
+        assert len(result.analysis.entities) == 1
+        entity = result.analysis.entities[0]
+        assert isinstance(entity, Entity)
+        assert entity.id == "e1"
+        assert entity.type == "person"
+
+        # Visual events must be real VisualEvent instances
+        assert len(result.analysis.visual_events) == 1
+        ve = result.analysis.visual_events[0]
+        assert isinstance(ve, VisualEvent)
+        assert ve.type == BehaviorType.APPROACH
+        assert ve.description == "Person approaches table"
+
+        # Audio events must be real AudioEvent instances
+        assert len(result.analysis.audio_events) == 1
+        ae = result.analysis.audio_events[0]
+        assert isinstance(ae, AudioEvent)
+        assert ae.type == SoundType.SPEECH
+        assert ae.text == "The person sits down."
+
+    def test_corrupt_analysis_json_does_not_crash(self, tmp_path):
+        """A corrupt analysis.json should not crash the pipeline."""
+        video = tmp_path / "v.mp4"
+        _make_video(video)
+        out = tmp_path / "out"
+        out.mkdir()
+        frames_dir = out / "frames"
+        frames_dir.mkdir()
+
+        # Pre-mark all stages as complete
+        db = TempoGraphDB(out / "tempograph.db")
+        db.insert_frame(
+            frame_idx=5,
+            timestamp_ms=166,
+            image_path=str(frames_dir / "frame_000005.jpg"),
+            is_keyframe=False,
+            delta_score=0.1,
+        )
+        for stage in [
+            "Frame selection",
+            "Audio transcription",
+            "YOLO detection",
+            "Depth estimation",
+            "Frame scoring",
+            "Dense captions",
+            "VLM captioning",
+            "Aggregation",
+        ]:
+            db.mark_stage_complete(stage, elapsed_s=1.0, n_units=1)
+        db.close()
+
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.imwrite(str(frames_dir / "frame_000005.jpg"), fake_frame)
+
+        config = PipelineConfig(
+            backend="llama-server",
+            modules={
+                "behavior": True,
+                "detection": True,
+                "depth": False,
+                "audio": False,
+            },
+            fps=1.0,
+            max_frames=20,
+            confidence=0.5,
+            video_path=str(video),
+            output_dir=str(out),
+        )
+
+        # Write a corrupt analysis.json (invalid JSON)
+        (out / "analysis.json").write_text("not valid json {{{")
+
+        # Mock out stages that would be skipped anyway
+        with patch("src.pipeline_v2.FrameSelector") as MockFS, patch(
+            "src.pipeline_v2.ObjectDetector"
+        ) as MockDet, patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, patch(
+            "src.pipeline_v2.CaptionAggregator"
+        ) as MockAgg, patch(
+            "src.pipeline_v2.FrameScorer"
+        ) as MockScorer, patch(
+            "src.pipeline_v2.WhisperCppTranscriber"
+        ) as MockWhisper:
+            MockFS.return_value.select.return_value = MagicMock(
+                frame_indices=[5],
+                keyframe_indices=[],
+                scan_indices=[5],
+                deltas=[0.1],
+            )
+            MockDet.return_value.detect_to_db = MagicMock()
+            MockDet.return_value.cleanup = MagicMock()
+            MockLLM.return_value.caption_frames_dynamic = MagicMock(return_value=[])
+            MockAgg.return_value.aggregate = MagicMock(
+                return_value=AnalysisResult(summary="ok")
+            )
+            MockScorer.return_value.score_and_select = MagicMock(return_value=[5])
+            MockWhisper.return_value.transcribe = MagicMock(return_value=[])
+
+            pipeline = PipelineV2(
+                config,
+                camera_mode=CameraMode.STATIC,
+                depth_enabled=False,
+                skip_vlm=False,
+            )
+            result = pipeline.run()
+
+        # The pipeline should not crash and should return None for analysis
+        assert result.analysis is None
+
+    def test_nonconformant_analysis_json_does_not_crash(self, tmp_path):
+        """A non-conformant analysis.json (valid JSON but wrong schema) should not crash."""
+        video = tmp_path / "v.mp4"
+        _make_video(video)
+        out = tmp_path / "out"
+        out.mkdir()
+        frames_dir = out / "frames"
+        frames_dir.mkdir()
+
+        # Pre-mark all stages as complete
+        db = TempoGraphDB(out / "tempograph.db")
+        db.insert_frame(
+            frame_idx=5,
+            timestamp_ms=166,
+            image_path=str(frames_dir / "frame_000005.jpg"),
+            is_keyframe=False,
+            delta_score=0.1,
+        )
+        for stage in [
+            "Frame selection",
+            "Audio transcription",
+            "YOLO detection",
+            "Depth estimation",
+            "Frame scoring",
+            "Dense captions",
+            "VLM captioning",
+            "Aggregation",
+        ]:
+            db.mark_stage_complete(stage, elapsed_s=1.0, n_units=1)
+        db.close()
+
+        fake_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.imwrite(str(frames_dir / "frame_000005.jpg"), fake_frame)
+
+        config = PipelineConfig(
+            backend="llama-server",
+            modules={
+                "behavior": True,
+                "detection": True,
+                "depth": False,
+                "audio": False,
+            },
+            fps=1.0,
+            max_frames=20,
+            confidence=0.5,
+            video_path=str(video),
+            output_dir=str(out),
+        )
+
+        # Write a non-conformant analysis.json (valid JSON but wrong schema)
+        import json
+
+        bad_data = {"entities": "not a list", "summary": 123}  # wrong types
+        (out / "analysis.json").write_text(json.dumps(bad_data))
+
+        # Mock out stages that would be skipped anyway
+        with patch("src.pipeline_v2.FrameSelector") as MockFS, patch(
+            "src.pipeline_v2.ObjectDetector"
+        ) as MockDet, patch("src.pipeline_v2.LlamaServerBackend") as MockLLM, patch(
+            "src.pipeline_v2.CaptionAggregator"
+        ) as MockAgg, patch(
+            "src.pipeline_v2.FrameScorer"
+        ) as MockScorer, patch(
+            "src.pipeline_v2.WhisperCppTranscriber"
+        ) as MockWhisper:
+            MockFS.return_value.select.return_value = MagicMock(
+                frame_indices=[5],
+                keyframe_indices=[],
+                scan_indices=[5],
+                deltas=[0.1],
+            )
+            MockDet.return_value.detect_to_db = MagicMock()
+            MockDet.return_value.cleanup = MagicMock()
+            MockLLM.return_value.caption_frames_dynamic = MagicMock(return_value=[])
+            MockAgg.return_value.aggregate = MagicMock(
+                return_value=AnalysisResult(summary="ok")
+            )
+            MockScorer.return_value.score_and_select = MagicMock(return_value=[5])
+            MockWhisper.return_value.transcribe = MagicMock(return_value=[])
+
+            pipeline = PipelineV2(
+                config,
+                camera_mode=CameraMode.STATIC,
+                depth_enabled=False,
+                skip_vlm=False,
+            )
+            result = pipeline.run()
+
+        # The pipeline should not crash and should return None for analysis
+        assert result.analysis is None
